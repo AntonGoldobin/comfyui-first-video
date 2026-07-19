@@ -3,7 +3,7 @@
 
 FROM runpod/worker-comfyui:5.8.4-base
 
-ARG HF_TOKEN=""
+# HF_TOKEN from environment (set by RunPod as secret) - no default!
 
 # Install required custom nodes
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes /comfyui/custom_nodes/ComfyUI-KJNodes && \
@@ -44,8 +44,8 @@ RUN HF_TOKEN=$HF_TOKEN comfy model download \
     --relative-path models/vae \
     --filename 'ltx2.3/LTX23_audio_vae_bf16.safetensors'
 
-# 3. Text Encoder - Gemma (required for LTX Video) - public model, use empty token
-RUN HF_TOKEN="" comfy model download \
+# 3. Text Encoder - Gemma (required for LTX Video) - public model, use HF_TOKEN from env if set
+RUN HF_TOKEN=${HF_TOKEN:-} comfy model download \
     --url 'https://huggingface.co/Sikaworld1990/gemma3-12B-hereticx-sikaworld-ltx-2/resolve/main/gemma3-12B-hereticx-sikaworld.safetensors' \
     --relative-path models/text_encoders \
     --filename 'ltx2.3/gemma3-12B-hereticx-sikaworld.safetensors'
