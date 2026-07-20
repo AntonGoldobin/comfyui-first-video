@@ -31,5 +31,11 @@ RUN git clone https://github.com/rgthree/rgthree-comfy /comfyui/custom_nodes/rgt
     (git fetch origin 8ff50e4521881eca1fe26aec9615fc9362474931 --depth=1 && git checkout 8ff50e4521881eca1fe26aec9615fc9362474931) || \
     echo "WARN: rgthree commit unreachable"
 
-# Models are loaded from /runpod-volume/models/ (network volume)
-# Use download-models.sh to download models to volume before deployment
+# Symlink model directories to network volume
+# Network volume mounts at /runpod-volume, models are at /runpod-volume/models/
+# ComfyUI looks for models in /comfyui/models/ by default
+RUN ln -sf /runpod-volume/models/vae /comfyui/models/vae && \
+    ln -sf /runpod-volume/models/diffusion_models /comfyui/models/diffusion_models && \
+    ln -sf /runpod-volume/models/text_encoders /comfyui/models/text_encoders && \
+    ln -sf /runpod-volume/models/loras /comfyui/models/loras && \
+    ln -sf /runpod-volume/models/latent_upscale_models /comfyui/models/latent_upscale_models
