@@ -29,3 +29,13 @@ RUN mkdir -p /comfyui/models && \
     ln -sf /runpod-volume/models/text_encoders /comfyui/models/text_encoders && \
     ln -sf /runpod-volume/models/loras /comfyui/models/loras && \
     ln -sf /runpod-volume/models/latent_upscale_models /comfyui/models/latent_upscale_models
+
+# Install Python dependencies for serverless handler
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt
+
+# Copy handler files
+COPY handler.py /handler.py
+COPY runpod_handler.py /runpod_handler.py
+COPY api-workflow.json /api-workflow.json
+COPY workflow.json /workflow.json
