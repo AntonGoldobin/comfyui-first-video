@@ -13,7 +13,7 @@ RUN git clone https://github.com/kijai/ComfyUI-KJNodes /comfyui/custom_nodes/Com
     cd /comfyui/custom_nodes/ComfyUI-KJNodes && git checkout main
 
 RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo /comfyui/custom_nodes/ComfyUI-LTXVideo && \
-    cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout main
+    cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout master
 
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     cd /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && git checkout main
