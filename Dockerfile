@@ -36,3 +36,9 @@ COPY handler.py /handler.py
 COPY runpod_handler.py /runpod_handler.py
 COPY api-workflow.json /api-workflow.json
 COPY workflow.json /workflow.json
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+# Override entrypoint to start ComfyUI first, then run handler
+ENTRYPOINT []
+CMD ["/start.sh"]
