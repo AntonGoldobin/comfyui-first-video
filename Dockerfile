@@ -8,7 +8,7 @@ ARG HF_TOKEN
 # Install git and dependencies
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-# Install required custom nodes with dependencies
+# Install required custom nodes
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes /comfyui/custom_nodes/ComfyUI-KJNodes && \
     cd /comfyui/custom_nodes/ComfyUI-KJNodes && git checkout main
 
@@ -17,7 +17,7 @@ RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo /comfyui/custom_nod
 
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     cd /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
-    pip install -e . && \
+    pip install opencv-python imageio-ffmpeg && \
     git checkout main
 
 RUN git clone https://github.com/rgthree/rgthree-comfy /comfyui/custom_nodes/rgthree-comfy && \
