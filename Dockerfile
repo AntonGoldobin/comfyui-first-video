@@ -4,6 +4,7 @@
 
 FROM runpod/worker-comfyui:5.8.4-base
 
+ARG HF_TOKEN
 # HF_TOKEN from environment (set by RunPod as secret) - no default!
 
 # Install required custom nodes
