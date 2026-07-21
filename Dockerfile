@@ -36,3 +36,8 @@ COPY handler.py /handler.py
 COPY runpod_handler.py /runpod_handler.py
 COPY api-workflow.json /api-workflow.json
 COPY workflow.json /workflow.json
+
+# Increase ComfyUI startup timeout (base image defaults are too short for network volumes)
+# 300 seconds should be enough for ComfyUI to load all models from network volume
+ENV COMFY_API_AVAILABLE_MAX_RETRIES=300
+ENV COMFY_API_AVAILABLE_INTERVAL_MS=1000
