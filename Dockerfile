@@ -19,8 +19,9 @@ RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /comfyui/c
 RUN git clone https://github.com/rgthree/rgthree-comfy /comfyui/custom_nodes/rgthree-comfy && \
     cd /comfyui/custom_nodes/rgthree-comfy && git checkout main
 
-# Symlink model directories to network volume
-RUN ln -sf /runpod-volume/models/vae /comfyui/models/vae && \
+# Create models directory and symlink model directories to network volume
+RUN mkdir -p /comfyui/models && \
+    ln -sf /runpod-volume/models/vae /comfyui/models/vae && \
     ln -sf /runpod-volume/models/diffusion_models /comfyui/models/diffusion_models && \
     ln -sf /runpod-volume/models/text_encoders /comfyui/models/text_encoders && \
     ln -sf /runpod-volume/models/loras /comfyui/models/loras && \
