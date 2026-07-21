@@ -3,8 +3,8 @@
 
 FROM runpod/worker-comfyui:5.8.4-base
 
-# Upgrade PyTorch to 2.8.0 for LTX Video support
-RUN pip install --upgrade torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# Upgrade PyTorch for LTX Video support
+RUN pip install --upgrade torch torchvision torchaudio
 
 # Install git
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
