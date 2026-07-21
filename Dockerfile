@@ -1,13 +1,14 @@
 # Minimal Dockerfile for ComfyUI LTX Video Serverless
 # Models are loaded from network volume at /runpod-volume/models/
-# See download-models.sh for downloading models to volume
 
 FROM runpod/worker-comfyui:5.8.4-base
 
 ARG HF_TOKEN
-# HF_TOKEN from environment (set by RunPod as secret) - no default!
 
-# Install required custom nodes - no specific commits, use latest
+# Install git first (base image doesn't have it)
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Install required custom nodes
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes /comfyui/custom_nodes/ComfyUI-KJNodes && \
     cd /comfyui/custom_nodes/ComfyUI-KJNodes && git checkout main
 
