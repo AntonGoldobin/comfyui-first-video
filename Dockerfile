@@ -3,9 +3,6 @@
 
 FROM runpod/worker-comfyui:5.8.4-base
 
-# Upgrade PyTorch for LTX Video support
-RUN pip install --upgrade torch torchvision torchaudio
-
 # Install git
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
