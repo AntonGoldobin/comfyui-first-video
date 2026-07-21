@@ -11,9 +11,9 @@ import runpod
 from runpod_handler import _worker
 
 
-def handler(job):
+async def handler(job):
     """Named handler for runpod.serverless.start()."""
-    return asyncio.get_event_loop().run_until_complete(_worker.handler(job))
+    return await _worker.handler(job)
 
 
 runpod.serverless.start({"handler": handler})
