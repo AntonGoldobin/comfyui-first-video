@@ -4,7 +4,7 @@ set -e
 # Start ComfyUI in background
 echo "Starting ComfyUI..."
 cd /comfyui
-python3 main.py --listen 0.0.0.0 --port 8188 --disable-smart-memory > /tmp/comfyui.log 2>&1 &
+python3 main.py --listen 0.0.0.0 --port 8188 --disable-smart-memory --disable-api-auth > /tmp/comfyui.log 2>&1 &
 COMFY_PID=$!
 
 # Wait for ComfyUI to be ready
