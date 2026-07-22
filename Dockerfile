@@ -1,7 +1,7 @@
 # Minimal Dockerfile for ComfyUI LTX Video Serverless
 # Models are loaded from network volume at /runpod-volume/models/
 
-FROM runpod/worker-comfyui:5.8.4-base
+FROM sombi/comfyui:base-torch2.8.0-cu124
 
 # Install git
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
