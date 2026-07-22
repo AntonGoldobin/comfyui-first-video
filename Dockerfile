@@ -39,7 +39,13 @@ COPY api-workflow.json /api-workflow.json
 COPY workflow.json /workflow.json
 COPY start.sh /start.sh
 
+# Make scripts executable (exit code 126 = cannot execute without this)
+RUN chmod +x /start.sh /handler.py /runpod_handler.py
+
 # Increase ComfyUI startup timeout (base image defaults are too short for network volumes)
 # 300 seconds should be enough for ComfyUI to load all models from network volume
 ENV COMFY_API_AVAILABLE_MAX_RETRIES=300
 ENV COMFY_API_AVAILABLE_INTERVAL_MS=1000
+
+# Override base image entrypoint with our start.sh
+ENTRYPOINT ["/bin/bash", "/start.sh"]
