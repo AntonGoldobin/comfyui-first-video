@@ -30,6 +30,7 @@ RUN mkdir -p /comfyui/models && \
 # Install Python dependencies for serverless handler
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
+RUN pip install opencv-python
 
 # Copy handler files (overwrite base image's handler with our LTX Video handler)
 COPY handler.py /handler.py
