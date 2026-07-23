@@ -9,12 +9,12 @@ COMFY_PID=$!
 
 # Wait for ComfyUI to be ready
 echo "Waiting for ComfyUI to start..."
-for i in {1..60}; do
+for i in {1..300}; do
     if curl -s http://localhost:8188/system_stats > /dev/null 2>&1; then
         echo "ComfyUI is ready!"
         break
     fi
-    echo "Waiting... ($i/60)"
+    echo "Waiting... ($i/300)"
     sleep 2
 done
 
