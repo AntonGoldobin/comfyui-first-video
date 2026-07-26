@@ -1,12 +1,8 @@
 """
-flash_deploy_comfy.py — Alternative: Use Flash with pre-built ComfyUI image
+flash_deploy_comfy.py — Deploy ComfyUI via Flash SDK
 
-NOTE: This approach uses Flash's image parameter to deploy a pre-built ComfyUI image.
-The @Endpoint handler then proxies requests to the running ComfyUI server.
-
-HOWEVER: This has limitations - Flash is designed for request-response functions,
-not long-running servers. For production ComfyUI serverless, use the traditional
-GitHub deployment approach instead.
+Правильный способ: используем Endpoint(image=...) как ОБЪЕКТ, не декоратор.
+Flash сам создаст/обновит serverless endpoint с указанным Docker образом.
 """
 
 import asyncio
@@ -14,81 +10,106 @@ import os
 import logging
 from typing import Dict, Any
 
-import httpx
 from runpod_flash import Endpoint, GpuType, NetworkVolume
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ComfyUI server URL (running in same container via custom image)
-COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
+# =============================================================================
+# Configuration
+# =============================================================================
 
-
-@Endpoint(
-    name="comfyui-proxy",
+# Создаём endpoint с кастомным Docker образом
+# Flash сам задеплоит это образ как serverless endpoint
+comfy_endpoint = Endpoint(
+    name="comfyui-ltx-worker",
+    image="runpod/worker-comfyui:5.8.4-base",  # Базовый ComfyUI образ
     gpu=GpuType.NVIDIA_GEFORCE_RTX_4090,
-    image="runpod/worker-comfyui:5.8.4-base",  # Pre-built ComfyUI image
-    volume=NetworkVolume(id="mbs1d3xwt0", name="reelant_volume", size=200),
+    workers=(0, 2),  # min, max workers
+    volume=NetworkVolume(
+        id="mbs1d3xwt0",
+        name="reelant_volume",
+        size=200
+    ),
     flashboot=True,
-    workers=(0, 2),
-    dependencies=["httpx"],
+    # env для передачи в container
     env={
-        "COMFY_URL": COMFY_URL,
+        "MODEL_PATH": "/runpod-volume/models",
     }
 )
-async def comfyui_proxy(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Proxy handler that submits workflows to local ComfyUI server.
 
-    The custom image (runpod/worker-comfyui) is expected to:
-    1. Start ComfyUI automatically on container boot
-    2. Expose it at http://127.0.0.1:8188
+# =============================================================================
+# Job Submission
+# =============================================================================
 
-    This handler then submits workflows and returns results.
+async def submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
     """
-    workflow = job.get("input", {}).get("workflow")
-    if not workflow:
-        return {"status": "error", "error": "No workflow provided"}
+    Отправляет workflow в ComfyUI endpoint.
+
+    Формат ожидаемый worker-comfyui:
+    {
+        "input": {
+            "workflow": { ... ComfyUI workflow JSON ... }
+        }
+    }
+    """
+    logger.info("Submitting workflow to ComfyUI...")
 
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            # Submit workflow
-            resp = await client.post(f"{COMFY_URL}/prompt", json={"prompt": workflow})
-            if resp.status_code != 200:
-                return {"status": "error", "error": f"Submit failed: {resp.text}"}
+        # .run() отправляет задачу и сразу возвращает Job объект
+        job = await comfy_endpoint.run({
+            "input": {
+                "workflow": workflow
+            }
+        })
 
-            prompt_id = resp.json().get("prompt_id")
+        logger.info(f"Job submitted: {job.id}")
 
-            # Poll for completion
-            for _ in range(300):  # 5 min timeout
-                await asyncio.sleep(2)
-                history_resp = await client.get(f"{COMFY_URL}/history/{prompt_id}")
-                if history_resp.status_code == 200:
-                    history = history_resp.json()
-                    if prompt_id in history:
-                        status = history[prompt_id].get("status", {})
-                        if status.get("state") == "success":
-                            return {
-                                "status": "success",
-                                "prompt_id": prompt_id,
-                                "outputs": history[prompt_id].get("outputs", {})
-                            }
-                        if status.get("state") == "failed":
-                            return {
-                                "status": "error",
-                                "error": f"Workflow failed: {status}"
-                            }
+        # Ждём выполнения
+        await job.wait()
 
-            return {"status": "error", "error": "Workflow timed out"}
+        logger.info(f"Job completed: {job.output}")
+        return job.output
 
     except Exception as e:
-        logger.exception("Error in comfyui_proxy")
+        logger.exception("Error submitting workflow")
         return {"status": "error", "error": str(e)}
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+async def main():
+    """Пример использования."""
+
+    # Пример workflow (нужно подставить реальный LTX Video workflow)
+    example_workflow = {
+        "3": {
+            "inputs": {
+                "model": "ltx2310eros_v1.safetensors",
+                "width": 848,
+                "height": 480,
+                "video_length": 33,
+                "prompt": "a beautiful landscape",
+                "negative_prompt": "blurry, low quality",
+                "seed": 42,
+                "steps": 20,
+                "cfg": 1.0,
+            },
+            "class_type": "LTXVideoPipe"
+        }
+    }
+
+    result = await submit_workflow(example_workflow)
+    print(f"Result: {result}")
 
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("Flash — ComfyUI Proxy (Experimental)")
-    logger.info("NOTE: For production, use GitHub deployment instead")
+    logger.info("Flash — ComfyUI LTX Video Deployment")
     logger.info("=" * 60)
-    asyncio.run(comfyui_proxy())
+    logger.info("Endpoint will be auto-deployed on first .run() call")
+    logger.info("=" * 60)
+
+    asyncio.run(main())
