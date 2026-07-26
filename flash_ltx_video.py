@@ -20,7 +20,7 @@ import subprocess
 import logging
 from typing import Dict, Any, Optional
 
-from runpod_flash import Endpoint, GpuType
+from runpod_flash import Endpoint, GpuType, NetworkVolume
 
 # Configure logging
 logging.basicConfig(
@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Configuration
 # =============================================================================
+
+# Network volume — reuse existing volume mbs1d3xwt0
+NETWORK_VOLUME = NetworkVolume(
+    id="mbs1d3xwt0",
+    name="reelant_volume",
+    size=200  # GB, will reuse existing if id matches
+)
 
 # ComfyUI configuration
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
@@ -316,11 +323,8 @@ def upload_to_s3(file_path: str, s3_key: str) -> Optional[str]:
 @Endpoint(
     name="comfyui-ltx-video",
     gpu=GpuType.NVIDIA_GEFORCE_RTX_4090,
-    network_volume={
-        "id": os.environ.get("RUNPOD_NETWORK_VOLUME_ID", "mbs1d3xwt0"),
-        "path": "/runpod-volume"
-    },
-    flash_boot=True,
+    volume=NETWORK_VOLUME,
+    flashboot=True,
     dependencies=[
         "torch",
         "transformers",
@@ -331,7 +335,7 @@ def upload_to_s3(file_path: str, s3_key: str) -> Optional[str]:
         "httpx",
         "boto3",
     ],
-    env_vars={
+    env={
         "COMFY_PORT": str(COMFY_PORT),
         "NETWORK_VOLUME_PATH": NETWORK_VOLUME_PATH,
     }
@@ -431,6 +435,7 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info(f"Network Volume: {NETWORK_VOLUME_PATH}")
     logger.info(f"Models Path: {MODELS_PATH}")
+    logger.info(f"Volume ID: {NETWORK_VOLUME.id}")
     logger.info("=" * 60)
 
     # Run the Flash endpoint
