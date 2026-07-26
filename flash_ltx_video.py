@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-# Network volume — reuse existing volume mbs1d3xwt0
+# Network volume — reuse existing volume ugiamecmm0
 NETWORK_VOLUME = NetworkVolume(
-    id="mbs1d3xwt0",
+    id="ugiamecmm0",
     name="reelant_volume",
     size=200  # GB, will reuse existing if id matches
 )
