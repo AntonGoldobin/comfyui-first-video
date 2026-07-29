@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-# Volume ID правильный: ugiamecmm0
+# Volume ID: f3falnf3r0 (network volume, EU-RO-1)
 NETWORK_VOLUME = NetworkVolume(
-    id="ugiamecmm0",
-    name="reelant_volume",
+    id="f3falnf3r0",
+    name="reelant_network",
     size=200
 )
 
@@ -96,7 +96,7 @@ async def main():
 if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Flash — ComfyUI LTX Video Deployment")
-    logger.info(f"Volume: ugiamecmm0")
+    logger.info(f"Volume: f3falnf3r0")
     logger.info("=" * 60)
 
     asyncio.run(main())

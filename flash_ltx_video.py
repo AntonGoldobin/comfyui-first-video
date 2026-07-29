@@ -20,7 +20,8 @@ import subprocess
 import logging
 from typing import Dict, Any, Optional
 
-from runpod_flash import Endpoint, GpuType, NetworkVolume
+from runpod_flash import Endpoint, GpuType, GpuGroup, NetworkVolume
+from runpod_flash.core.resources.datacenter import DataCenter
 
 # Configure logging
 logging.basicConfig(
@@ -33,12 +34,16 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-# Network volume — reuse existing volume ugiamecmm0
-NETWORK_VOLUME = NetworkVolume(
-    id="ugiamecmm0",
-    name="reelant_volume",
-    size=200  # GB, will reuse existing if id matches
+# Network volumes — BOTH volumes for full GPU access
+NETWORK_VOLUME_EU = NetworkVolume(
+    id="f3falnf3r0",
+    name="reelant-network",
+    size=200,  # GB, will reuse existing if id matches
+    datacenter=DataCenter.EU_RO_1
 )
+
+# List of volumes - only EU volume f3falnf3r0
+NETWORK_VOLUMES = [NETWORK_VOLUME_EU]
 
 # ComfyUI configuration
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
@@ -100,7 +105,7 @@ def start_comfyui() -> subprocess.Popen:
     """
     # ComfyUI startup command
     cmd = [
-        "/opt/venv/bin/python",
+        "python3",
         "-m", "comfyui_main",
         "--port", str(COMFY_PORT),
         "--listen", COMFY_HOST,
@@ -321,10 +326,11 @@ def upload_to_s3(file_path: str, s3_key: str) -> Optional[str]:
 # =============================================================================
 
 @Endpoint(
-    name="comfyui-ltx-video",
-    gpu=GpuType.NVIDIA_GEFORCE_RTX_4090,
-    volume=NETWORK_VOLUME,
+    name="comfyui-ltx-video-v4",
+    gpu=GpuGroup.ADA_24,
+    volume=NETWORK_VOLUMES,
     flashboot=True,
+    datacenter=["EU-RO-1"],
     dependencies=[
         "torch",
         "transformers",
@@ -340,16 +346,17 @@ def upload_to_s3(file_path: str, s3_key: str) -> Optional[str]:
         "NETWORK_VOLUME_PATH": NETWORK_VOLUME_PATH,
     }
 )
-async def comfyui_ltx_handler(job: Dict[str, Any]) -> Dict[str, Any]:
+async def comfyui_ltx_handler(**job_input: Dict[str, Any]) -> Dict[str, Any]:
     """
     Flash endpoint handler for ComfyUI LTX Video generation.
 
     This function runs on RunPod serverless GPU.
+    Flash unpacks the input object and passes it as keyword arguments.
 
     Args:
-        job: Input dict with:
+        job_input: Input dict with:
             - workflow: ComfyUI workflow JSON
-            - images: Optional dict of {node_id: base64_image_data}
+            - images: Optional list of {name, image} dicts
 
     Returns:
         Dict with:
@@ -374,8 +381,9 @@ async def comfyui_ltx_handler(job: Dict[str, Any]) -> Dict[str, Any]:
         _comfy_ready = True
         logger.info("ComfyUI ready, processing job")
 
-    # Extract job input
-    workflow = job.get("input", {}).get("workflow")
+    # Extract job input (Flash passes these as keyword args)
+    workflow = job_input.get("workflow")
+    images = job_input.get("images", [])
     if not workflow:
         return {
             "status": "error",
@@ -416,6 +424,8 @@ async def comfyui_ltx_handler(job: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "status": "success",
         "prompt_id": prompt_id,
+        "videoUrl": output_urls[0]["url"] if output_urls else None,
+        "images": output_urls,
         "outputs": output_urls
     }
 
@@ -433,9 +443,9 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("RunPod Flash — ComfyUI LTX Video Serverless")
     logger.info("=" * 60)
-    logger.info(f"Network Volume: {NETWORK_VOLUME_PATH}")
+    logger.info(f"Network Volume Path: {NETWORK_VOLUME_PATH}")
     logger.info(f"Models Path: {MODELS_PATH}")
-    logger.info(f"Volume ID: {NETWORK_VOLUME.id}")
+    logger.info(f"Volume IDs: {[v.id for v in NETWORK_VOLUMES]}")
     logger.info("=" * 60)
 
     # Run the Flash endpoint
