@@ -224,7 +224,11 @@ class ComfyUIWorker:
 
     def __init__(self):
         self.s3 = S3Manager()
-        self.httpx_client = None
+        # Initialize httpx client immediately (setup() may not be called before first job)
+        self.httpx_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        )
 
     def setup(self, config: Dict[str, Any]):
         """Called once at container startup (before first job)."""
