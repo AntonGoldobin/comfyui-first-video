@@ -356,6 +356,21 @@ class ComfyUIWorker:
         # Prepare workflow - replace input image paths
         workflow_copy = json.loads(json.dumps(workflow))  # Deep copy
 
+        # Handle new ComfyUI workflow format (nodes as list)
+        # Convert from: {"nodes": [{"id": 2, "type": "LoadImage", ...}, ...]}
+        # To old format: {"2": {"class_type": "LoadImage", "inputs": {...}}, ...}
+        if isinstance(workflow_copy.get('nodes'), list):
+            logger.info("Converting workflow from new format to old format")
+            old_format = {}
+            for node in workflow_copy['nodes']:
+                node_id = str(node.get('id', ''))
+                old_format[node_id] = {
+                    'class_type': node.get('type', ''),
+                    'inputs': node.get('inputs', {}),
+                }
+            workflow_copy = old_format
+            logger.info(f"Converted {len(workflow_copy)} nodes to old format")
+
         # Update image references in LoadImage nodes
         for node_id, node_data in workflow_copy.items():
             if node_data.get('class_type') == 'LoadImage':
