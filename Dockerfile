@@ -1,8 +1,8 @@
 # Dockerfile for ComfyUI LTX Video Serverless Worker
-# Based on runpod/worker-comfyui:5.8.4-base with LTX Video customizations
+# Based on sombi/comfyui:base-torch2.8.0-cu124 with LTX Video customizations
 # Models are loaded from network volume at /runpod-volume/models/
 
-FROM runpod/worker-comfyui:5.8.4-base
+FROM sombi/comfyui:base-torch2.8.0-cu124
 
 # =============================================================================
 # Install git for cloning custom nodes
