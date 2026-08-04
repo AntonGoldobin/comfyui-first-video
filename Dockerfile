@@ -38,19 +38,19 @@ RUN mkdir -p /comfyui/models && \
 # CRITICAL: Mirror ComfyUI's full dependency set into /opt/venv
 # This prevents missing module errors during workflow execution
 # =============================================================================
-RUN /opt/venv/bin/pip install --no-cache-dir \
+RUN pip3 install --no-cache-dir \
     -r /comfyui/requirements.txt \
     && for r in /comfyui/custom_nodes/*/requirements.txt; do \
-         [ -f "$r" ] && /opt/venv/bin/pip install --no-cache-dir -r "$r" || true; \
+         [ -f "$r" ] && pip3 install --no-cache-dir -r "$r" || true; \
        done \
-    && /opt/venv/bin/pip install --no-cache-dir "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+    && pip3 install --no-cache-dir "transformers>=4.50.3,<5" "huggingface-hub<1.0"
 
 # =============================================================================
 # Install serverless handler dependencies
 # =============================================================================
 COPY requirements.txt /tmp/requirements.txt
-RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
-RUN /opt/venv/bin/pip install --no-cache-dir opencv-python imageio_ffmpeg
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+RUN pip3 install --no-cache-dir opencv-python imageio_ffmpeg
 
 # =============================================================================
 # Copy handler files
