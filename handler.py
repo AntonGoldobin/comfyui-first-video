@@ -270,8 +270,19 @@ class ComfyUIWorker:
             images = job_input.get('images', [])
             s3_config = job_input.get('s3Config')
 
+            # Handle double-serialization: if workflow is a string, parse it
+            if isinstance(workflow, str):
+                logger.warning(f"Job {job_id}: workflow received as string, parsing...")
+                try:
+                    workflow = json.loads(workflow)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"workflow is a string but not valid JSON: {e}")
+
             if not workflow:
                 raise ValueError("No workflow found in job input")
+
+            if not isinstance(workflow, dict):
+                raise ValueError(f"workflow is not a dict after parsing: {type(workflow)}")
 
             # Override S3 config from job input if provided
             s3 = self.s3
