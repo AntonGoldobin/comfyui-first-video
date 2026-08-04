@@ -35,15 +35,14 @@ RUN mkdir -p /comfyui/models && \
     ln -sf /runpod-volume/models/latent_upscale_models /comfyui/models/latent_upscale_models
 
 # =============================================================================
-# CRITICAL: Mirror ComfyUI's full dependency set into /opt/venv
-# This prevents missing module errors during workflow execution
+# CRITICAL: Mirror ComfyUI's full dependency set
+# Note: /comfyui/requirements.txt may not exist in base image, skip if missing
 # =============================================================================
 RUN pip3 install --no-cache-dir \
-    -r /comfyui/requirements.txt \
+    "transformers>=4.50.3,<5" "huggingface-hub<1.0" \
     && for r in /comfyui/custom_nodes/*/requirements.txt; do \
          [ -f "$r" ] && pip3 install --no-cache-dir -r "$r" || true; \
-       done \
-    && pip3 install --no-cache-dir "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+       done
 
 # =============================================================================
 # Install serverless handler dependencies
