@@ -486,8 +486,9 @@ class ComfyUIWorker:
         """
         output_files = []
 
-        # Find outputs in /output directory (ComfyUI default)
-        output_dirs = ['/output', '/workspace/ComfyUI/output', os.path.expanduser('~/ComfyUI/output')]
+        # Find outputs in /comfyui/output (set via --base-directory and --output-directory)
+        # Also check legacy locations for backwards compatibility
+        output_dirs = ['/comfyui/output', '/output', '/workspace/ComfyUI/output', os.path.expanduser('~/ComfyUI/output')]
 
         found_files = []
         for odir in output_dirs:

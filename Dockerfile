@@ -26,13 +26,18 @@ RUN git clone https://github.com/rgthree/rgthree-comfy /comfyui/custom_nodes/rgt
 
 # =============================================================================
 # Link models from network volume to ComfyUI models directory
+# CRITICAL: Without these, ComfyUI defaults to /workspace/ComfyUI (ephemeral ~5GB)
+# which will fill up and cause "No space left on device" errors.
+# With --base-directory /comfyui and these symlinks, all writes go to network volume.
 # =============================================================================
 RUN mkdir -p /comfyui/models && \
     ln -sf /runpod-volume/models/vae /comfyui/models/vae && \
     ln -sf /runpod-volume/models/diffusion_models /comfyui/models/diffusion_models && \
     ln -sf /runpod-volume/models/text_encoders /comfyui/models/text_encoders && \
     ln -sf /runpod-volume/models/loras /comfyui/models/loras && \
-    ln -sf /runpod-volume/models/latent_upscale_models /comfyui/models/latent_upscale_models
+    ln -sf /runpod-volume/models/latent_upscale_models /comfyui/models/latent_upscale_models && \
+    ln -sf /runpod-volume/output /comfyui/output && \
+    ln -sf /runpod-volume/temp /comfyui/temp
 
 # =============================================================================
 # CRITICAL: Mirror ComfyUI's full dependency set

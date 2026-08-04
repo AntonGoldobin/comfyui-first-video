@@ -57,6 +57,8 @@ cd /comfyui
 # --disable-metadata: Don't add metadata to outputs
 # --verbose: Set log level
 # --log-stdout: Log to stdout
+# CRITICAL: --base-directory ensures ALL paths point to /comfyui (symlinked to network volume)
+# Without this, ComfyUI defaults to /workspace/ComfyUI which has only ~5GB ephemeral storage
 /opt/venv/bin/python main.py \
     --listen 0.0.0.0 \
     --port 8188 \
@@ -64,6 +66,9 @@ cd /comfyui
     --disable-metadata \
     --verbose "${COMFY_LOG_LEVEL:-INFO}" \
     --log-stdout \
+    --base-directory /comfyui \
+    --output-directory /comfyui/output \
+    --temp-directory /comfyui/temp \
     > /tmp/comfyui.log 2>&1 &
 
 COMFY_PID=$!
