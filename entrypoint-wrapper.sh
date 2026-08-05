@@ -100,14 +100,14 @@ fi
 echo ""
 echo "=== Starting ComfyUI on port 8188 (bypassing base entrypoint) ==="
 
-cd /comfyui
+cd /workspace/ComfyUI
 
 # Start ComfyUI directly with correct port
 # --disable-auto-launch: Don't auto-launch browser
 # --disable-metadata: Don't add metadata to outputs
 # --verbose: Set log level
 # --log-stdout: Log to stdout
-# CRITICAL: --base-directory ensures ALL paths point to /comfyui (symlinked to network volume)
+# CRITICAL: --base-directory ensures ALL paths point to /workspace/ComfyUI (where sombi/base rsyncs ComfyUI)
 /workspace/venv/bin/python main.py \
     --listen 0.0.0.0 \
     --port 8188 \
@@ -115,9 +115,9 @@ cd /comfyui
     --disable-metadata \
     --verbose "${COMFY_LOG_LEVEL:-INFO}" \
     --log-stdout \
-    --base-directory /comfyui \
-    --output-directory /comfyui/output \
-    --temp-directory /comfyui/temp \
+    --base-directory /workspace/ComfyUI \
+    --output-directory /workspace/ComfyUI/output \
+    --temp-directory /workspace/ComfyUI/temp \
     > /tmp/comfyui.log 2>&1 &
 
 COMFY_PID=$!
