@@ -108,7 +108,7 @@ cd /comfyui
 # --verbose: Set log level
 # --log-stdout: Log to stdout
 # CRITICAL: --base-directory ensures ALL paths point to /comfyui (symlinked to network volume)
-/opt/venv/bin/python main.py \
+/workspace/venv/bin/python main.py \
     --listen 0.0.0.0 \
     --port 8188 \
     --disable-auto-launch \
@@ -181,4 +181,4 @@ echo ""
 echo "=== Starting RunPod Serverless Handler ==="
 
 cd /
-exec /opt/venv/bin/python /handler.py
+exec /workspace/venv/bin/python /handler.py
