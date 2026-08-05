@@ -25,6 +25,17 @@ RUN git clone https://github.com/rgthree/rgthree-comfy /comfyui/custom_nodes/rgt
     cd /comfyui/custom_nodes/rgthree-comfy && git checkout main
 
 # =============================================================================
+# CRITICAL: Redirect /workspace to network volume
+# The sombi/base image does rsync of ComfyUI+venv to /workspace (~20GB+).
+# Without this, /workspace fills ephemeral storage (~5GB) and crashes.
+# This symlink must be created BEFORE the base image's entrypoint runs.
+# =============================================================================
+RUN rm -rf /workspace && \
+    mkdir -p /runpod-volume/workspace && \
+    ln -s /runpod-volume/workspace /workspace && \
+    echo "Created symlink: /workspace -> /runpod-volume/workspace"
+
+# =============================================================================
 # Link models from network volume to ComfyUI models directory
 # CRITICAL: Without these, ComfyUI defaults to /workspace/ComfyUI (ephemeral ~5GB)
 # which will fill up and cause "No space left on device" errors.
