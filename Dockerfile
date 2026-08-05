@@ -90,8 +90,9 @@ ENV HISTORY_POLL_INTERVAL=2000
 ENV HISTORY_TIMEOUT=600
 
 # =============================================================================
-# Use entrypoint-wrapper to setup symlinks BEFORE base image entrypoint runs
-# Then chain to original base image entrypoint, and finally run start.sh
+# Use entrypoint-wrapper to bypass base image entrypoint entirely
+# The base image would start ComfyUI on port 3000, but we need 8188.
+# Our wrapper directly launches ComfyUI with correct port, then runs handler.
 # =============================================================================
 ENTRYPOINT ["/usr/local/bin/entrypoint-wrapper.sh"]
-CMD ["/start.sh"]
+# No CMD needed - entrypoint-wrapper handles everything
