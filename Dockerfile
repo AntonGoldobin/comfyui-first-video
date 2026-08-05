@@ -73,9 +73,10 @@ RUN pip3 install --no-cache-dir opencv-python imageio_ffmpeg
 COPY handler.py /handler.py
 COPY api-workflow.json /api-workflow.json
 COPY workflow.json /workflow.json
+COPY entrypoint-wrapper.sh /usr/local/bin/entrypoint-wrapper.sh
 
 # Make scripts executable
-RUN chmod +x /handler.py /start.sh
+RUN chmod +x /handler.py /start.sh /usr/local/bin/entrypoint-wrapper.sh
 
 # =============================================================================
 # Environment variables
@@ -89,6 +90,8 @@ ENV HISTORY_POLL_INTERVAL=2000
 ENV HISTORY_TIMEOUT=600
 
 # =============================================================================
-# Override base image entrypoint with our start.sh
+# Use entrypoint-wrapper to setup symlinks BEFORE base image entrypoint runs
+# Then chain to original base image entrypoint, and finally run start.sh
 # =============================================================================
-ENTRYPOINT ["/bin/bash", "/start.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint-wrapper.sh"]
+CMD ["/start.sh"]
