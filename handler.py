@@ -396,11 +396,20 @@ class ComfyUIWorker:
                         inputs['image'] = input_files[img_name]
                         logger.info(f"Replaced image path for {img_name}: {input_files[img_name]}")
 
+        logger.info(f"===== DEBUG: Submitting workflow to {COMFY_HOST_URL}/prompt =====")
+        logger.info(f"Workflow payload: {json.dumps(workflow_copy, indent=2)}")
+        logger.info(f"===== END DEBUG =====")
+
         resp = await self.httpx_client.post(
             f'{COMFY_HOST_URL}/prompt',
             json={'prompt': workflow_copy},
             headers=get_api_headers()
         )
+
+        logger.info(f"Response status: {resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"Response body: {resp.text}")
+
         resp.raise_for_status()
 
         result = resp.json()
