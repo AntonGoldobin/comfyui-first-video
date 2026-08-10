@@ -1,18 +1,135 @@
 #!/bin/bash
-set -e
+# NOTE: set +e (NOT set -e) — we want graceful fallback through candidate paths.
+# Previous version's set -e plus missing /opt/venv/bin/python returned exit 127
+# before any of our error logging ran. RunPod's worker-exit logs don't capture
+# stderr from the ENTRYPOINT script reliably, so the only way to debug is to
+# preflight-print the diagnostic information we need.
+set +e
 
-echo "=== EntryPoint Wrapper: ComfyUI startup (image venv) ==="
+echo "=== EntryPoint Wrapper: ComfyUI startup (defensive) ==="
 echo "Timestamp: $(date -Iseconds)"
 
 # =============================================================================
-# Why this wrapper exists
+# DIAGNOSTIC: List what exists so we know the image layout
 # =============================================================================
-# The sombi/base entrypoint runs ComfyUI on port 3000 via 'exec python main.py'
-# which replaces this shell. We MUST bypass it entirely and run ComfyUI ourselves
-# on port 8188, using the IMAGE's installed /opt/venv (not the network volume's
-# /workspace/venv, which carries a stale CUDA-13-compiled torchaudio and
-# triggers "libcudart.so.13: cannot open shared object" errors that block
-# startup). See commit message for details.
+echo ""
+echo "=== DIAG: Available python/venv paths ==="
+for p in /opt/venv/bin/python /workspace/venv/bin/python /comfyui/venv/bin/python /usr/local/bin/python3 /usr/bin/python3; do
+    if [ -x "$p" ] 2>/dev/null; then
+        echo "  [EXEC] $p"
+    elif [ -f "$p" ] 2>/dev/null; then
+        echo "  [FILE, NO EXEC] $p"
+    else
+        echo "  [MISSING] $p"
+    fi
+done
+
+echo ""
+echo "=== DIAG: Available ComfyUI directories ==="
+for d in /comfyui /workspace/ComfyUI /runpod-volume/workspace/ComfyUI; do
+    if [ -f "$d/main.py" ]; then
+        echo "  [OK] $d/main.py"
+    else
+        echo "  [MISSING] $d/main.py"
+    fi
+done
+
+# =============================================================================
+# AUTO-DETECT PYTHON (must have torch + CUDA)
+# =============================================================================
+echo ""
+echo "=== Auto-detecting Python with torch + CUDA ==="
+
+PYTHON_BIN=""
+for candidate in /opt/venv/bin/python /workspace/venv/bin/python /comfyui/venv/bin/python; do
+    if [ -x "$candidate" ]; then
+        if "$candidate" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+            PYTHON_BIN="$candidate"
+            echo "Selected (image/venv): $candidate"
+            break
+        else
+            echo "  $candidate — torch/CUDA test FAILED (skipping)"
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_BIN" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+        PYTHON_BIN="$(command -v python3)"
+        echo "Selected (system python3): $PYTHON_BIN"
+    fi
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo "FATAL: no python with torch+CUDA found in any expected location"
+    echo ""
+    echo "ls /opt:"
+    ls -la /opt 2>&1 | head -10
+    echo ""
+    echo "ls /workspace:"
+    ls -la /workspace 2>&1 | head -10
+    echo ""
+    echo "ls /comfyui:"
+    ls -la /comfyui 2>&1 | head -10
+    echo ""
+    echo "which python3:"
+    which python3 2>&1
+    echo ""
+    echo "PATH: $PATH"
+    exit 127
+fi
+
+# =============================================================================
+# AUTO-DETECT COMFYUI DIR
+# =============================================================================
+echo ""
+echo "=== Auto-detecting ComfyUI ==="
+
+COMFYUI_DIR=""
+for candidate in /comfyui /workspace/ComfyUI /runpod-volume/workspace/ComfyUI; do
+    if [ -f "$candidate/main.py" ]; then
+        COMFYUI_DIR="$candidate"
+        echo "Selected: $candidate"
+        break
+    fi
+done
+
+if [ -z "$COMFYUI_DIR" ]; then
+    echo "FATAL: no ComfyUI main.py found in /comfyui, /workspace/ComfyUI, /runpod-volume/workspace/ComfyUI"
+    exit 127
+fi
+
+# =============================================================================
+# SHOW VENV VERSIONS
+# =============================================================================
+echo ""
+echo "=== Venv versions ==="
+TORCHAUDIO_VER=$("$PYTHON_BIN" -c "import torchaudio; print(torchaudio.__version__)" 2>&1)
+echo "torchaudio: $TORCHAUDIO_VER"
+TORCH_VER=$("$PYTHON_BIN" -c "import torch; print(torch.__version__, 'cuda', torch.version.cuda)" 2>&1)
+echo "torch: $TORCH_VER"
+
+# =============================================================================
+# If using network-volume venv, REMOVE bad CUDA-13 torchaudio/torchvision
+# (network volume's venv was rsync'd from a previous container with cu130 wheels;
+# the image's runtime cuda is cu128, so loading these triggers
+# libcudart.so.13 errors and blocks ComfyUI startup.)
+# Audio modules will fail to import (soft error), but ComfyUI continues.
+# =============================================================================
+case "$PYTHON_BIN" in
+    /workspace/venv*|/runpod-volume/workspace/venv*)
+        echo ""
+        echo "=== Removing stale torchaudio/torchvision from network-volume venv ==="
+        rm -rf /workspace/venv/lib/python*/site-packages/torchaudio* 2>/dev/null
+        rm -rf /workspace/venv/lib/python*/site-packages/torchvision* 2>/dev/null
+        rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchaudio* 2>/dev/null
+        rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchvision* 2>/dev/null
+        echo "Done (audio modules will fail to import; ComfyUI continues)"
+        ;;
+    *)
+        echo "Using image venv — bad torchaudio not present (no cleanup needed)"
+        ;;
+esac
 
 # =============================================================================
 # GPU PRE-FLIGHT CHECK
@@ -20,41 +137,34 @@ echo "Timestamp: $(date -Iseconds)"
 echo ""
 echo "=== GPU Pre-flight Check ==="
 
-if ! command -v nvidia-smi &> /dev/null; then
-    echo "ERROR: nvidia-smi not found"
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "FATAL: nvidia-smi not found"
     exit 1
 fi
 
 GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>&1)
-if [ $? -ne 0 ]; then
-    echo "ERROR: nvidia-smi query failed: $GPU_INFO"
-    exit 1
-fi
 echo "GPU: $GPU_INFO"
 
-echo "Testing CUDA kernel access..."
-CUDA_TEST=$(/opt/venv/bin/python -c "
+CUDA_TEST=$("$PYTHON_BIN" -c "
 import torch
 if not torch.cuda.is_available():
     print('ERROR: CUDA not available')
     exit(1)
-device = torch.device('cuda:0')
-x = torch.randn(1024, 1024, device=device)
+x = torch.randn(1024, 1024, device='cuda:0')
 y = x @ x.T
-result = y.cpu().numpy()
-print(f'CUDA test passed: {result.shape}')
+print(f'CUDA test passed: {y.cpu().numpy().shape}')
 " 2>&1)
 if [ $? -ne 0 ]; then
-    echo "ERROR: CUDA kernel test failed: $CUDA_TEST"
+    echo "FATAL: CUDA kernel test failed: $CUDA_TEST"
     exit 1
 fi
-echo "CUDA test: $CUDA_TEST"
+echo "CUDA: $CUDA_TEST"
 
 # =============================================================================
-# NETWORK VOLUME SETUP — only for model + output dirs (not for venv or ComfyUI)
+# NETWORK VOLUME — only for model + output dirs (not for venv or ComfyUI)
 # =============================================================================
 echo ""
-echo "=== Verifying network volume mounts ==="
+echo "=== Network volume setup ==="
 
 is_runpod_mounted() {
     if mount | grep -q "on /runpod-volume "; then
@@ -70,149 +180,129 @@ is_runpod_mounted() {
 }
 
 if is_runpod_mounted; then
-    echo "Network volume detected at /runpod-volume"
+    echo "Network volume mounted at /runpod-volume"
     mkdir -p /runpod-volume/models/{vae,diffusion_models,text_encoders,loras,latent_upscale_models,output,temp}
 
-    # Ensure model symlinks exist in IMAGE's /comfyui (Dockerfile creates them at
-    # build time, but verify + repair in case the image was rebuilt without them).
-    mkdir -p /comfyui/models
+    mkdir -p "$COMFYUI_DIR/models"
     for d in vae diffusion_models text_encoders loras latent_upscale_models; do
-        if [ ! -e /comfyui/models/$d ]; then
-            ln -sf /runpod-volume/models/$d /comfyui/models/$d
+        if [ ! -e "$COMFYUI_DIR/models/$d" ]; then
+            ln -sf /runpod-volume/models/$d "$COMFYUI_DIR/models/$d"
         fi
     done
     mkdir -p /runpod-volume/output /runpod-volume/temp
-    if [ ! -e /comfyui/output ]; then
-        ln -sf /runpod-volume/output /comfyui/output
+    if [ ! -e "$COMFYUI_DIR/output" ]; then
+        ln -sf /runpod-volume/output "$COMFYUI_DIR/output"
     fi
-    if [ ! -e /comfyui/temp ]; then
-        ln -sf /runpod-volume/temp /comfyui/temp
+    if [ ! -e "$COMFYUI_DIR/temp" ]; then
+        ln -sf /runpod-volume/temp "$COMFYUI_DIR/temp"
     fi
-    echo "Model + output directories ready"
+    echo "Model + output dirs ready"
 else
-    echo "WARNING: /runpod-volume not mounted, using local /comfyui (ephemeral)"
+    echo "WARNING: /runpod-volume not mounted, using local dirs (ephemeral)"
 fi
 
 # =============================================================================
-# Verify IMAGE's venv is what we want (not network volume's)
+# START COMFYUI
 # =============================================================================
 echo ""
-echo "=== Verifying image venv ==="
-if [ ! -x /opt/venv/bin/python ]; then
-    echo "ERROR: /opt/venv/bin/python not found in image"
-    exit 1
-fi
-VENV_TORCHAUDIO=$(/opt/venv/bin/python -c "import torchaudio; print(torchaudio.__version__)" 2>&1 || echo "IMPORT-FAILED")
-echo "Image venv torchaudio: $VENV_TORCHAUDIO"
-VENV_TORCH=$(/opt/venv/bin/python -c "import torch; print(torch.__version__, 'cuda', torch.version.cuda)" 2>&1)
-echo "Image venv torch: $VENV_TORCH"
+echo "=== Starting ComfyUI on port 8188 ==="
+echo "Python: $PYTHON_BIN"
+echo "ComfyUI: $COMFYUI_DIR"
+echo "Args: --listen 0.0.0.0 --port 8188 --disable-auto-launch --disable-metadata --base-directory $COMFYUI_DIR"
 
-# =============================================================================
-# START ComfyUI using IMAGE's /opt/venv and IMAGE's /comfyui
-# =============================================================================
-echo ""
-echo "=== Starting ComfyUI on port 8188 (image venv, image code) ==="
+cd "$COMFYUI_DIR"
 
-cd /comfyui
-
-/opt/venv/bin/python main.py \
+# shellcheck disable=SC2086
+"$PYTHON_BIN" main.py \
     --listen 0.0.0.0 \
     --port 8188 \
     --disable-auto-launch \
     --disable-metadata \
     --verbose "${COMFY_LOG_LEVEL:-INFO}" \
     --log-stdout \
-    --base-directory /comfyui \
-    --output-directory /comfyui/output \
-    --temp-directory /comfyui/temp \
+    --base-directory "$COMFYUI_DIR" \
+    --output-directory "$COMFYUI_DIR/output" \
+    --temp-directory "$COMFYUI_DIR/temp" \
     > /tmp/comfyui.log 2>&1 &
 
 COMFY_PID=$!
-echo "ComfyUI started with PID: $COMFY_PID"
+echo "ComfyUI PID: $COMFY_PID"
 echo $COMFY_PID > /tmp/comfyui.pid
-echo "PID file written to /tmp/comfyui.pid"
 
 # =============================================================================
-# WAIT for ComfyUI to be ready (with verbose curl diagnostics — mirrors
-# check_server() in handler.py since the handler is never called if startup
-# fails, so this loop is the only window we have to see why)
+# POLL for /system_stats — REAL polling (sleep 1 every iter)
+#
+# Previous bug: after i=50 the loop did `sleep 0.000` (computed from
+# INTERVAL_SEC=0.0), so the loop actually spun for ~50 seconds, not
+# $MAX_RETRIES seconds. Now MAX_RETRIES=600 → ~10 minutes of real polling.
 # =============================================================================
 echo ""
-echo "=== Waiting for ComfyUI to be ready ==="
-
-MAX_RETRIES=${COMFY_API_AVAILABLE_MAX_RETRIES:-300}
-INTERVAL_MS=${COMFY_API_AVAILABLE_INTERVAL_MS:-1000}
-INTERVAL_SEC=0.$(printf "%03d" $((INTERVAL_MS % 1000)))
-INTERVAL_SEC=${INTERVAL_SEC%.*}
-
-# Verbose diagnostic flags (Aug 10 2026 — Phase 15 close-out).
-_LOGGED_FIRST_HTTP=0
-_LOGGED_FIRST_LOG=0
-_LOGGED_FIRST_DEATH=0
+echo "=== Polling for /system_stats (real wait, no early sleep-0) ==="
+MAX_RETRIES=${COMFY_API_AVAILABLE_MAX_RETRIES:-600}
+LOGGED_FIRST_HTTP=0
+LOGGED_FIRST_LOG=0
 LAST_LOG_LINES=0
-
 HTTP_CODE="000"
-HTTP_BODY=""
 
 for i in $(seq 1 $MAX_RETRIES); do
-    # Check if process is still alive
     if ! kill -0 $COMFY_PID 2>/dev/null; then
-        echo "ERROR: ComfyUI process died during startup. Logs:"
+        echo ""
+        echo "ERROR: ComfyUI process $COMFY_PID died during startup"
+        echo ""
+        echo "=== FULL ComfyUI log ($(wc -l < /tmp/comfyui.log 2>/dev/null || echo 0) lines) ==="
         cat /tmp/comfyui.log
         exit 1
     fi
 
-    # Check HTTP endpoint with verbose diagnostic
-    HTTP_CODE=$(curl -s -o /tmp/comfyui_probe.txt -w "%{http_code}" http://localhost:8188/system_stats 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -s -o /tmp/comfyui_probe.txt -w "%{http_code}" --max-time 2 http://localhost:8188/system_stats 2>/dev/null || echo "000")
+
     if [ "$HTTP_CODE" = "200" ]; then
-        echo "ComfyUI is ready at http://localhost:8188 (after $i attempts)"
+        echo "ComfyUI ready (after $i attempts)"
         break
     fi
 
-    # DIAG: log first HTTP failure in detail
-    if [ "$_LOGGED_FIRST_HTTP" -eq 0 ] && [ $i -ge 3 ]; then
-        HTTP_BODY=$(cat /tmp/comfyui_probe.txt 2>/dev/null | head -c 200 || true)
-        echo "[DIAG] First HTTP probe (attempt $i): code=$HTTP_CODE body=${HTTP_BODY:0:200}"
-        _LOGGED_FIRST_HTTP=1
+    # DIAG: First HTTP failure with response body
+    if [ "$LOGGED_FIRST_HTTP" -eq 0 ] && [ $i -ge 3 ]; then
+        HTTP_BODY=$(cat /tmp/comfyui_probe.txt 2>/dev/null | head -c 300 || true)
+        echo "[DIAG] attempt $i: HTTP=$HTTP_CODE body=${HTTP_BODY}"
+        LOGGED_FIRST_HTTP=1
     fi
 
-    # DIAG: log first 10 lines of ComfyUI log so we see where it's stuck
-    if [ "$_LOGGED_FIRST_LOG" -eq 0 ] && [ -f /tmp/comfyui.log ]; then
+    # DIAG: First chunk of ComfyUI log so we see where it's stuck
+    if [ "$LOGGED_FIRST_LOG" -eq 0 ] && [ -f /tmp/comfyui.log ]; then
         LOG_LINES=$(wc -l < /tmp/comfyui.log 2>/dev/null || echo 0)
         if [ "$LOG_LINES" -gt 5 ]; then
-            echo "[DIAG] ComfyUI log has $LOG_LINES lines so far — last 10:"
-            tail -10 /tmp/comfyui.log
-            _LOGGED_FIRST_LOG=1
+            echo "[DIAG] ComfyUI log first 20 lines (out of $LOG_LINES):"
+            head -20 /tmp/comfyui.log
+            LOGGED_FIRST_LOG=1
             LAST_LOG_LINES=$LOG_LINES
         fi
     fi
 
-    # DIAG: every 60 attempts, show last 5 lines so we see if log is updating
+    # DIAG: every 60 attempts, show progress (or stuck)
     if [ $((i % 60)) -eq 0 ] && [ -f /tmp/comfyui.log ]; then
         CUR_LINES=$(wc -l < /tmp/comfyui.log 2>/dev/null || echo 0)
         if [ "$CUR_LINES" -ne "$LAST_LOG_LINES" ]; then
-            echo "[DIAG] ComfyUI log progressed (was $LAST_LOG_LINES, now $CUR_LINES) — last 5:"
-            tail -5 /tmp/comfyui.log
+            echo "[DIAG] attempt $i — log progressing ($LAST_LOG_LINES → $CUR_LINES lines)"
+            tail -3 /tmp/comfyui.log
             LAST_LOG_LINES=$CUR_LINES
         else
-            echo "[DIAG] ComfyUI log stuck at $CUR_LINES lines (likely hung)"
+            echo "[DIAG] attempt $i — log STUCK at $CUR_LINES lines (ComfyUI may be hung)"
         fi
     fi
 
-    if [ $((i % 10)) -eq 0 ]; then
-        echo "Waiting for ComfyUI... ($i/$MAX_RETRIES)"
+    if [ $((i % 30)) -eq 0 ]; then
+        echo "Waiting for ComfyUI... ($i/$MAX_RETRIES, http=$HTTP_CODE)"
     fi
 
-    if [ $i -lt 50 ]; then
-        sleep 1
-    else
-        sleep $INTERVAL_SEC
-    fi
+    sleep 1
 done
 
-# Final check
 if [ "$HTTP_CODE" != "200" ]; then
-    echo "ERROR: ComfyUI failed to start after $MAX_RETRIES attempts. Final HTTP=$HTTP_CODE. Logs:"
+    echo ""
+    echo "ERROR: ComfyUI failed to bind 8188 after $MAX_RETRIES attempts (final HTTP=$HTTP_CODE)"
+    echo ""
+    echo "=== FULL ComfyUI log ($(wc -l < /tmp/comfyui.log 2>/dev/null || echo 0) lines) ==="
     cat /tmp/comfyui.log
     exit 1
 fi
@@ -220,10 +310,9 @@ fi
 echo "ComfyUI is ready at http://localhost:8188"
 
 # =============================================================================
-# START RunPod Serverless Handler (image's venv)
+# START RunPod Serverless Handler
 # =============================================================================
 echo ""
 echo "=== Starting RunPod Serverless Handler ==="
-
 cd /
-exec /opt/venv/bin/python /handler.py
+exec "$PYTHON_BIN" /handler.py
