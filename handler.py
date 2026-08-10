@@ -97,6 +97,11 @@ def check_server(url: str, retries: int = 0, delay_ms: int = 50) -> bool:
     logger.info(f"Checking ComfyUI server at {url}")
     logger.info(f"Max retries: {fallback_retries}, interval: {delay_ms}ms")
 
+    # Verbose diagnostic: log first HTTP error in detail (Aug 10 2026 — Phase 15 close-out).
+    # Without this the runpod serverless log shows only "Waiting for ComfyUI... (300/300)"
+    # with no indication of whether the failure was ConnectionRefused, Timeout, or HTTP 5xx.
+    _logged_first_error = False
+
     while True:
         # Check if ComfyUI process crashed
         process_alive = _is_comfyui_process_alive()
@@ -110,8 +115,20 @@ def check_server(url: str, retries: int = 0, delay_ms: int = 50) -> bool:
             if response.status_code == 200:
                 logger.info(f"ComfyUI API is reachable after {attempt} attempts")
                 return True
-        except requests.RequestException:
-            pass
+            # Non-200 — log it on the first occurrence only to avoid log spam.
+            if not _logged_first_error:
+                logger.warning(
+                    f"[DIAG] ComfyUI returned non-200 on attempt {attempt}: "
+                    f"status={response.status_code} body={response.text[:200]!r}"
+                )
+                _logged_first_error = True
+        except requests.RequestException as exc:
+            if not _logged_first_error:
+                logger.warning(
+                    f"[DIAG] ComfyUI HTTP error on attempt {attempt}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _logged_first_error = True
 
         attempt += 1
 
