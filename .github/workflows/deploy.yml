@@ -24,27 +24,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Wait for Docker image to be available
-        # docker.yml pushes antongoldobin/comfyui-ltx-video:latest on push.
-        # We poll Docker Hub registry until the digest changes to match HEAD.
-        env:
-          IMAGE_REPO: antongoldobin/comfyui-ltx-video
-          IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
-        run: |
-          set -euo pipefail
-          TARGET_SHA=$(git rev-short HEAD)
-          echo "Waiting for image to be pushed by docker.yml workflow..."
-          for i in $(seq 1 60); do
-            RESP=$(curl -fsS "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags/${IMAGE_TAG}/" 2>/dev/null || echo '{}')
-            if echo "$RESP" | grep -q "$TARGET_SHA"; then
-              echo "✅ Image with SHA $TARGET_SHA found in Docker Hub"
-              exit 0
-            fi
-            echo "  attempt $i/60: image not yet updated (waiting 10s)"
-            sleep 10
-          done
-          echo "❌ Timeout waiting for image. Deploying without SHA match."
-          exit 0  # deploy anyway — :latest will be picked up
+      - name: Wait for Docker image push
+        # docker.yml runs in parallel; it pushes antongoldobin/comfyui-ltx-video:latest.
+        # We don't poll Docker Hub (tag page doesn't carry git SHA, polling is fragile).
+        # Instead: brief sleep to let the push complete before Flash pulls the image.
+        run: sleep 30
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -99,7 +83,7 @@ jobs:
           import os, time, requests
 
           KEY = os.environ['RUNPOD_FLASH_API_KEY']
-          PROD_EID = "3995g4nz6mxw1v"
+          PROD_EID = "f3l545i0ej27dz"
           url = f"https://api.runpod.ai/v2/{PROD_EID}/health"
 
           deadline = time.time() + 600
@@ -137,7 +121,7 @@ jobs:
           import os, time, requests
 
           KEY = os.environ['RUNPOD_API_KEY']
-          PROD_EID = "3995g4nz6mxw1v"
+          PROD_EID = "f3l545i0ej27dz"
           url = f"https://api.runpod.ai/v2/{PROD_EID}/run"
 
           payload = {
@@ -174,5 +158,5 @@ jobs:
           echo "### RunPod Flash Deploy" >> $GITHUB_STEP_SUMMARY
           echo "- SHA: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`antongoldobin/comfyui-ltx-video:${{ inputs.image_tag || 'latest' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Endpoint: \`hon_cyan_tiger\` (\`3995g4nz6mxw1v\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- Endpoint: \`hon_cyan_tiger\` (\`f3l545i0ej27dz\`)" >> $GITHUB_STEP_SUMMARY
           echo "- Trigger: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
