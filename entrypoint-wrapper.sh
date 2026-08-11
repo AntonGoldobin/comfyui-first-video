@@ -110,20 +110,26 @@ TORCH_VER=$("$PYTHON_BIN" -c "import torch; print(torch.__version__, 'cuda', tor
 echo "torch: $TORCH_VER"
 
 # =============================================================================
-# If using network-volume venv, REMOVE bad CUDA-13 torchaudio/torchvision
-# (network volume's venv was rsync'd from a previous container with cu130 wheels;
-# the image's runtime cuda is cu128, so loading these triggers
-# libcudart.so.13 errors and blocks ComfyUI startup.)
-# Audio modules will fail to import (soft error), but ComfyUI continues.
+# If using network-volume venv, REMOVE bad CUDA-13 torchaudio
+# (network volume's venv was rsync'd from a previous container with cu130
+# torchaudio wheel; the image's runtime cuda is cu128, so loading its
+# _torchaudio.so extension triggers libcudart.so.13 errors and blocks
+# ComfyUI startup. Audio modules fail to import — soft error, ComfyUI
+# continues.)
+#
+# CRITICAL: do NOT remove torchvision — ComfyUI's
+# comfy/ldm/cascade/stage_c_coder.py imports torchvision at top-level and
+# the worker dies with ModuleNotFoundError if we remove it. Only the
+# torchaudio extension binary is incompatible with the cu128 runtime.
 # =============================================================================
 case "$PYTHON_BIN" in
     /workspace/venv*|/runpod-volume/workspace/venv*)
         echo ""
-        echo "=== Removing stale torchaudio/torchvision from network-volume venv ==="
-        rm -rf /workspace/venv/lib/python*/site-packages/torchaudio* 2>/dev/null
-        rm -rf /workspace/venv/lib/python*/site-packages/torchvision* 2>/dev/null
-        rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchaudio* 2>/dev/null
-        rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchvision* 2>/dev/null
+        echo "=== Removing stale CUDA-13 torchaudio from network-volume venv (keep torchvision) ==="
+        rm -rf /workspace/venv/lib/python*/site-packages/torchaudio 2>/dev/null
+        rm -rf /workspace/venv/lib/python*/site-packages/torchaudio-* 2>/dev/null
+        rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchaudio 2>/dev/null
+        rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchaudio-* 2>/dev/null
         echo "Done (audio modules will fail to import; ComfyUI continues)"
         ;;
     *)
