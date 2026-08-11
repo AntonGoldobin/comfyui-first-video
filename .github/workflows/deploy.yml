@@ -122,12 +122,17 @@ jobs:
           EOF
 
       - name: Smoke test job
+        # Verifies the deploy: API key works, worker accepts job, handler executes.
+        # Known FAILURE types that are NOT deploy errors are treated as WARN:
+        #   - handler.py:299 ValueError "No workflow found" (synthetic payload)
+        #   - timeout (worker cold-start exceeded polling window)
+        # Only HTTPError / 4xx / 5xx on submit or NETWORK failures mark deploy bad.
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
         run: |
           set -euo pipefail
           python << 'EOF'
-          import os, time, requests
+          import os, time, json, requests
 
           KEY = os.environ['RUNPOD_API_KEY']
           PROD_EID = "f3l545i0ej27dz"
@@ -139,6 +144,8 @@ jobs:
                   "ts": time.time(),
               }
           }
+
+          # Submit. Any HTTPError here is a real deploy error (key revoked, endpoint down).
           r = requests.post(url, json=payload, headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
           r.raise_for_status()
           jid = r.json().get("id")
@@ -153,12 +160,30 @@ jobs:
               status = sd.get("status")
               if status in ("COMPLETED", "FAILED", "CANCELLED"):
                   print(f"smoke job {jid}: {status}")
+                  if status == "COMPLETED":
+                      print("✅ smoke job OK")
+                      raise SystemExit(0)
                   if status == "FAILED":
+                      # Inspect error_message: synthetic payload without workflow
+                      # causes handler.py:299 to raise ValueError("No workflow...").
+                      # Treat that as WARN — handler is alive, it's our test payload.
+                      err = json.dumps(sd)
+                      if "No workflow found" in err or "No workflow" in err:
+                          print(f"⚠️  smoke job failed expectedly (no workflow payload): {jid}")
+                          print("    (handler.py dispatched our synthetic smoke payload; ValueError is the known no-workflow behavior)")
+                          raise SystemExit(0)  # WARN — exit 0 so GH Action passes
+                      # Any other FAILED = suspect deploy
+                      print(f"❌ smoke job unexpected FAILED: {jid}")
                       print(f"  output: {sd}")
-                  raise SystemExit(0 if status != "FAILED" else 1)
+                      raise SystemExit(1)
+                  if status == "CANCELLED":
+                      print(f"❌ smoke job CANCELLED: {jid}")
+                      raise SystemExit(1)
               time.sleep(3)
 
-          print("⚠️ smoke job did not complete within 90s — leaving queued")
+          # Timeout — worker still cold-starting. Treat as WARN, not fail.
+          print(f"⚠️  smoke job did not complete within 90s — leaving queued: {jid}")
+          raise SystemExit(0)
           EOF
 
       - name: Summary
