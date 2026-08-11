@@ -15,6 +15,15 @@ concurrency:
   group: runpod-deploy
   cancel-in-progress: false
 
+# Secrets used in deploy.yml:
+#   RUNPOD_FLASH_API_KEY  — control-plane key (from `flash login`)
+#                            → endpoint creation/deletion + /v2/{eid}/health
+#   RUNPOD_API_KEY        — data-plane key (from RunPod Console → API Keys)
+#                            → POST /v2/{eid}/run for smoke test jobs
+# Two separate keys: rotate independently.
+# Phase 17 cutover (2026-08-11): endpoint id changed 3995g4nz6mxw1v
+# → f3l545i0ej27dz; RUNPOD_API_KEY rotated to one bound to new id.
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
