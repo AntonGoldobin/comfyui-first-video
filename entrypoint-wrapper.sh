@@ -110,27 +110,50 @@ TORCH_VER=$("$PYTHON_BIN" -c "import torch; print(torch.__version__, 'cuda', tor
 echo "torch: $TORCH_VER"
 
 # =============================================================================
-# If using network-volume venv, REMOVE bad CUDA-13 torchaudio
-# (network volume's venv was rsync'd from a previous container with cu130
-# torchaudio wheel; the image's runtime cuda is cu128, so loading its
-# _torchaudio.so extension triggers libcudart.so.13 errors and blocks
-# ComfyUI startup. Audio modules fail to import — soft error, ComfyUI
-# continues.)
+# Reconcile network-volume venv with what current ComfyUI needs.
 #
-# CRITICAL: do NOT remove torchvision — ComfyUI's
-# comfy/ldm/cascade/stage_c_coder.py imports torchvision at top-level and
-# the worker dies with ModuleNotFoundError if we remove it. Only the
-# torchaudio extension binary is incompatible with the cu128 runtime.
+# The network volume's /workspace/venv was rsync'd from a previous sombi
+# image and is out of sync with the current /workspace/ComfyUI code:
+#
+#   - torchaudio wheel is cu130-built → loads libcudart.so.13 at import
+#     and crashes. Must REMOVE.
+#   - torchvision is missing entirely → ComfyUI imports it at top level
+#     (comfy/ldm/cascade/stage_c_coder.py:19) and dies with
+#     ModuleNotFoundError if absent. Must INSTALL.
+#
+# Install path: pytorch cu128 index, version pinned to match torch 2.8.0.
+# This is slow on first run (~30-60s for torchvision wheel ~700 MB) but
+# pip caches in $HOME/.cache/pip, so subsequent container starts are fast
+# (or skip install entirely if torchvision is already present).
 # =============================================================================
 case "$PYTHON_BIN" in
     /workspace/venv*|/runpod-volume/workspace/venv*)
         echo ""
-        echo "=== Removing stale CUDA-13 torchaudio from network-volume venv (keep torchvision) ==="
+        echo "=== Reconciling network-volume venv (remove bad torchaudio, install torchvision) ==="
+
+        # Step 1: remove cu130 torchaudio (causes libcudart.so.13 errors).
         rm -rf /workspace/venv/lib/python*/site-packages/torchaudio 2>/dev/null
         rm -rf /workspace/venv/lib/python*/site-packages/torchaudio-* 2>/dev/null
         rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchaudio 2>/dev/null
         rm -rf /runpod-volume/workspace/venv/lib/python*/site-packages/torchaudio-* 2>/dev/null
-        echo "Done (audio modules will fail to import; ComfyUI continues)"
+        echo "  - removed cu130 torchaudio"
+
+        # Step 2: install torchvision if missing (matching torch 2.8.0+cu128).
+        if "$PYTHON_BIN" -c "import torchvision; print('torchvision', torchvision.__version__)" 2>/dev/null; then
+            echo "  - torchvision already present, skipping install"
+        else
+            echo "  - torchvision missing; installing torchvision==0.23.0+cu128 (matching torch 2.8.0+cu128)..."
+            if "$PYTHON_BIN" -m pip install --quiet --no-cache-dir \
+                torchvision==0.23.0+cu128 \
+                --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -5; then
+                NEW_TV=$("$PYTHON_BIN" -c "import torchvision; print(torchvision.__version__)" 2>&1)
+                echo "  - torchvision installed: $NEW_TV"
+            else
+                echo "  - WARNING: torchvision install FAILED — ComfyUI may fail to import"
+            fi
+        fi
+
+        echo "Done (audio modules will fail to import; ComfyUI has torchvision)"
         ;;
     *)
         echo "Using image venv — bad torchaudio not present (no cleanup needed)"
