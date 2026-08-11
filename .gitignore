@@ -1,2 +1,7 @@
 .flash/
 .flash
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
