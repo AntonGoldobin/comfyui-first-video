@@ -425,7 +425,16 @@ class ComfyUIWorker:
 
         logger.info(f"Response status: {resp.status_code}")
         if resp.status_code != 200:
-            logger.error(f"Response body: {resp.text}")
+            body = resp.text
+            logger.error(f"Response body: {body}")
+            # Re-raise with body in the message so RunPod's error_message captures it
+            # (otherwise the actual ComfyUI rejection reason is lost — we only see
+            # "400 Bad Request" without the validation detail).
+            raise httpx.HTTPStatusError(
+                f"ComfyUI /prompt returned {resp.status_code} {resp.reason_phrase} — body: {body[:1500]}",
+                request=resp.request,
+                response=resp,
+            )
 
         resp.raise_for_status()
 
