@@ -59,7 +59,11 @@ CONTROL_PLANE_URL = "https://api.runpod.io/graphql"
 DATA_PLANE_URL_TPL = "https://api.runpod.ai/v2/{eid}/health"
 
 # Same proven params as prod (mirrors deploy/flash_config.py).
-IMAGE = "antongoldobin/comfyui-ltx-video:latest"
+# Override tag via ENDPOINT_IMAGE_TAG env var (e.g. `:debug-3131efa`) to
+# deploy an alternate image for debugging without touching prod endpoint.
+_IMAGE_NAME = "antongoldobin/comfyui-ltx-video"
+_IMAGE_TAG = os.environ.get("ENDPOINT_IMAGE_TAG", "latest")
+IMAGE = f"{_IMAGE_NAME}:{_IMAGE_TAG}"
 NETWORK_VOLUME_ID = "f3falnf3r0"
 DATACENTER = "EU-RO-1"
 
