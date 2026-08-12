@@ -151,6 +151,30 @@ def _image() -> str:
     return f"{DEFAULT_IMAGE}:{tag}"
 
 
+def _read_s3_env() -> list[tuple[str, str]]:
+    """S3 env injected into the worker container so handler.py can upload
+    ComfyUI outputs (mp4/png) and return presigned URLs back to Reelant.
+
+    Without these env vars, handler.py's _upload_outputs() returns
+    {"type": "local", "data": "file://..."} — Reelant's runpod-reconciler
+    only accepts URLs starting with http (extractVideoUrl), so the
+    generation "succeeds" but no video URL is ever recorded.
+
+    Source: Reelant infra/.env.local (Golden Antelope S3, EU).
+    Values are baked at deploy time so we don't burn a CI secret for
+    non-secret config.
+    """
+    pairs = [
+        ("S3_BUCKET", "reelant"),
+        ("S3_ACCESS_KEY_ID", "qPlYfemQcxQXZlfL"),
+        ("S3_SECRET_ACCESS_KEY", "VSuLUN1Wli2hRctt771qyW9tWinxpJbW"),
+        ("S3_ENDPOINT_URL", "https://s3-api.cr.golden-antelope.ru"),
+        ("S3_REGION", "us-east-1"),
+        ("S3_FORCE_PATH_STYLE", "true"),
+    ]
+    return [(k, v) for k, v in pairs if v]
+
+
 def build_cfg() -> ClassicEndpointConfig:
     """Return a fresh ClassicEndpointConfig for the prod endpoint."""
     return ClassicEndpointConfig(
@@ -166,10 +190,10 @@ def build_cfg() -> ClassicEndpointConfig:
         container_disk_gb=CONTAINER_DISK_GB,
         scaler_type=SCALER_TYPE,
         scaler_value=SCALER_VALUE,
-        # No env needed for prod — handler.py reads RUNPOD_AI_API_KEY / etc.
-        # directly from the classic runtime. Adding env here would just
-        # override what the runtime injects.
-        template_env=[],
+        # S3 env (Golden Antelope bucket) injected for handler.py output
+        # upload. RunPod-provided RUNPOD_AI_API_KEY / RUNPOD_POD_ID come
+        # from the runtime automatically — no need to add them here.
+        template_env=_read_s3_env(),
     )
 
 
