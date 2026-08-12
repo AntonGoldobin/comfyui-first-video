@@ -304,6 +304,36 @@ class ComfyUIWorker:
         logger.info(f"Job {job_id} received")
         logger.info(f"Job input keys: {list(job_input.keys())}")
 
+        # Fast-fail validation (Phase 19): recognize synthetic probes and
+        # short-circuit before spinning up ComfyUI. Without this, every
+        # test probe runs the full ComfyUI startup (5–30 s of GPU-seconds
+        # wasted per probe) and either:
+        #   - returns ValueError("No workflow found") from below
+        #   - or worse, runs a partial workflow and fails mid-execution
+        # Recognized probe keys (any one of):
+        #   - flash_smoke_test: bool   — RunPod deploy smoke test (CI)
+        #   - dry_run: bool            — explicit no-op from Reelant
+        #   - ping / healthcheck: bool — kubernetes-style liveness probe
+        if any(job_input.get(k) for k in ("flash_smoke_test", "dry_run", "ping", "healthcheck")):
+            logger.info(f"Job {job_id}: synthetic probe detected — short-circuiting")
+            return {
+                "status": "ok",
+                "probe": True,
+                "job_id": job_id,
+                "msg": "smoke test fast-path (Phase 19)",
+            }
+
+        # Fast-fail for missing workflow (saves 5-30s of ComfyUI startup
+        # for malformed probes that don't set any probe flag).
+        if not (job_input.get("workflow") or job_input.get("prompt")):
+            recognized = {"flash_smoke_test", "dry_run", "ping", "healthcheck",
+                          "workflow", "prompt", "images", "s3Config"}
+            raise ValueError(
+                f"No workflow found in job input. "
+                f"Recognized keys: {sorted(recognized)}. "
+                f"Got: {sorted(job_input.keys())}"
+            )
+
         try:
             # Extract workflow and config from job input
             workflow = job_input.get('workflow') or job_input.get('prompt')

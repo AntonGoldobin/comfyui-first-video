@@ -135,12 +135,17 @@ jobs:
               if status in ("COMPLETED", "FAILED", "CANCELLED"):
                   print(f"smoke job {jid}: {status}")
                   if status == "COMPLETED":
-                      print("✅ smoke job OK")
+                      # Phase 19: handler fast-paths probes (flash_smoke_test,
+                      # dry_run, ping, healthcheck) — returns {"status": "ok",
+                      # "probe": True} instead of running ComfyUI. So we now
+                      # see COMPLETED for our smoke payload, not FAILED.
+                      print("✅ smoke job OK (handler fast-path)")
                       raise SystemExit(0)
                   if status == "FAILED":
-                      # Inspect error_message: synthetic payload without workflow
-                      # causes handler.py to raise ValueError("No workflow found").
-                      # Treat that as WARN — handler is alive, it's our test payload.
+                      # Legacy behavior (pre-Phase 19): handler raised
+                      # ValueError("No workflow found") on synthetic payload.
+                      # Still tolerated as WARN for backward compat with old
+                      # handler images that haven't deployed the fast-path.
                       err = json.dumps(sd)
                       if "No workflow found" in err or "No workflow" in err:
                           print(f"⚠️  smoke job failed expectedly (no workflow payload): {jid}")
