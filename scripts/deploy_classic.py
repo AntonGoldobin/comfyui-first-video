@@ -30,6 +30,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -149,15 +150,23 @@ LIST_ENDPOINTS_QUERY = """
 # Steps
 # -----------------------------------------------------------------------------
 
-def save_endpoint(endpoint_input: dict) -> str:
+def save_endpoint(endpoint_input: dict, update_existing_id: str | None = None) -> str:
     """Create or update the classic serverless endpoint. Returns endpoint id.
 
-    The template is passed INLINE — RunPod requires a serverless template
-    (not the pod template you'd get from saveTemplate). Runtime creates
-    a serverless template id from the inline fields.
+    If update_existing_id is set, the call UPDATES the endpoint with that id
+    instead of creating a new one (this is what keeps the id stable across
+    deploys — Reelant RUNPOD_ENDPOINT_ID never changes). The template
+    payload is passed INLINE — RunPod requires a serverless template
+    (not the pod template you'd get from saveTemplate). Runtime creates a
+    serverless template id from the inline fields.
     """
-    _log("saveEndpoint", f"name={endpoint_input['name']} gpu={endpoint_input['gpuIds']}")
-    data = _graphql(SAVE_ENDPOINT_MUTATION, {"input": endpoint_input})
+    payload = dict(endpoint_input)
+    if update_existing_id:
+        payload["id"] = update_existing_id
+        _log("saveEndpoint", f"UPDATE id={update_existing_id} image={endpoint_input.get('template', {}).get('imageName', '?')}")
+    else:
+        _log("saveEndpoint", f"CREATE name={endpoint_input['name']} gpu={endpoint_input['gpuIds']}")
+    data = _graphql(SAVE_ENDPOINT_MUTATION, {"input": payload})
     ep = (data.get("saveEndpoint") or {})
     eid = ep.get("id")
     if not eid:
@@ -246,8 +255,20 @@ def wait_for_worker_ready(endpoint_id: str, timeout_s: int) -> bool:
 # -----------------------------------------------------------------------------
 
 def main() -> int:
+    # CLI args: --force-recreate deletes the existing endpoint and creates
+    # a new one (id WILL change — Reelant will need a secrets update).
+    # Default: update in place, keeping the id stable.
+    ap = argparse.ArgumentParser(description="Deploy classic RunPod serverless endpoint")
+    ap.add_argument("--force-recreate", action="store_true",
+                    help="Delete existing endpoint and create new (id changes)")
+    args = ap.parse_args()
+
     print("=" * 70)
     print(f"PROD CUTOVER (classic) — endpoint={PROD_ENDPOINT_NAME}")
+    if args.force_recreate:
+        print("MODE: --force-recreate (id will change)")
+    else:
+        print("MODE: update-in-place (id stable across deploys)")
     print("=" * 70)
     print(f"image:    {cfg.image}")
     print(f"gpu:      {cfg.gpu_id} @ {cfg.datacenter_id}")
@@ -271,34 +292,38 @@ def main() -> int:
     if pre_existing:
         _log("preflight", f"existing endpoint {PROD_ENDPOINT_NAME}={pre_existing[0]['id']}")
 
-    # --- Step 1: delete existing endpoint (saves a re-create round trip) ---
-    if pre_existing:
+    update_id: str | None = None
+    if pre_existing and not args.force_recreate:
+        # Default: update in place — keep the existing id stable.
+        update_id = pre_existing[0]["id"]
+        _log("preflight", f"will UPDATE in place, id={update_id} (stable across deploys)")
+    elif pre_existing and args.force_recreate:
+        # Forced: delete + recreate — id WILL change.
         _log("step1", f"deleting existing endpoint id={pre_existing[0]['id']}")
         if not delete_endpoint(pre_existing[0]["id"]):
             _log("step1", "warn: failed to delete — will use saveEndpoint upsert")
+        # Cleanup orphaned template from the deleted endpoint
+        _log("step1b", f"cleaning orphaned template '{cfg.template_name}' (if any)")
+        delete_template_by_name(cfg.template_name)
 
-    # --- Step 1b: cleanup orphaned template (no endpoint referencing it) ---
-    # RunPod rejects saveEndpoint with "template names must be unique" if a
-    # previous endpoint was deleted but its template (named after the
-    # endpoint, i.e. cfg.template_name) is still alive. Delete it now.
-    _log("step1b", f"cleaning orphaned template '{cfg.template_name}' (if any)")
-    delete_template_by_name(cfg.template_name)
-
-    # --- Step 2: create endpoint with inline serverless template ---
-    _log("step2", "creating endpoint via saveEndpoint (inline serverless template)")
+    # --- Step 2: create or update endpoint with inline serverless template ---
     try:
-        new_eid = save_endpoint(cfg.to_endpoint_input())
+        new_eid = save_endpoint(cfg.to_endpoint_input(), update_existing_id=update_id)
     except SystemExit as e:
         _log("step2", f"❌ FAILED: {e}")
         return 1
 
-    # --- Step 3: id-change advisory ---
-    if new_eid == OLD_PROD_EID:
+    # --- Step 3: id-change advisory (only on --force-recreate) ---
+    if update_id and new_eid == update_id:
+        _log("step3", f"✅ id stable: {new_eid} — Reelant integration unchanged")
+    elif update_id and new_eid != update_id:
+        _log("step3", f"⚠️  id changed despite update mode: {update_id} → {new_eid}")
+    elif new_eid == OLD_PROD_EID:
         _log("step3", "✅ new endpoint id matches old — Reelant integration unchanged")
     else:
         print()
         print("=" * 70)
-        print(f"⚠️  ENDPOINT ID CHANGED")
+        print(f"⚠️  ENDPOINT ID CHANGED (force-recreate)")
         print("=" * 70)
         print(f"   old: {OLD_PROD_EID}")
         print(f"   new: {new_eid}")
@@ -318,7 +343,7 @@ def main() -> int:
     print("=" * 70)
     print(f"endpoint: {PROD_ENDPOINT_NAME} ({new_eid})")
     print(f"image:    {cfg.image}")
-    if new_eid != OLD_PROD_EID:
+    if not update_id and new_eid != OLD_PROD_EID:
         print(f"⚠️  Update Reelant RUNPOD_ENDPOINT_ID: {new_eid}")
     return 0
 
