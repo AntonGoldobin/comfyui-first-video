@@ -37,9 +37,13 @@ NETWORK_VOLUME_ID = "f3falnf3r0"  # EU-RO-1, 200 GB — DO NOT DELETE
 DEFAULT_IMAGE = "antongoldobin/comfyui-ltx-video"
 DEFAULT_IMAGE_TAG = "latest"
 
-# (min, max) workers — `(1, 3)` keeps one warm worker to avoid cold starts
-# while allowing bursty scaling. Bumping max increases GPU spend.
-WORKERS_MIN = 1
+# (min, max) workers — `(0, 3)` scales from zero so idle hours don't bleed
+# GPU-seconds on a warm worker we never use (Aug 11 2026: a single warm
+# RTX 4090 idle overnight cost ~$8, more than all failed jobs combined).
+# Trade-off: first job after idle pays a 30-60 s cold start (~+$0.01).
+# Reelant jobs come in bursts from users, not continuous traffic, so the
+# burst scaling handles it well.
+WORKERS_MIN = 0
 WORKERS_MAX = 3
 
 # execution_timeout_ms: serverless job hard limit. 30 min matches RunPod max
@@ -47,8 +51,9 @@ WORKERS_MAX = 3
 EXECUTION_TIMEOUT_MS = 30 * 60 * 1000
 
 # idle_timeout: serverless scales workers to zero after N seconds idle.
-# 60 s keeps costs down — Reelant jobs come in bursts.
-IDLE_TIMEOUT_SECONDS = 60
+# 30 s is the sweet spot — long enough to absorb rapid back-to-back jobs,
+# short enough that a forgotten endpoint doesn't bleed overnight.
+IDLE_TIMEOUT_SECONDS = 30
 
 # GPU scarcity external risk: if RTX 4090 unavailable at EU-RO-1, Flash will
 # queue. We don't multi-GPU-type the endpoint because that doubles deploy time
