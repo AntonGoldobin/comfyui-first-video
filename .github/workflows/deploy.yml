@@ -1,4 +1,4 @@
-name: Deploy to RunPod Serverless
+name: Deploy to RunPod Serverless (classic)
 
 on:
   push:
@@ -18,11 +18,15 @@ concurrency:
 # Secrets used in deploy.yml:
 #   RUNPOD_FLASH_API_KEY  — control-plane key (from `flash login`)
 #                            → endpoint creation/deletion + /v2/{eid}/health
-#   RUNPOD_API_KEY        — data-plane key (from RunPod Console → API Keys)
-#                            → POST /v2/{eid}/run for smoke test jobs
-# Two separate keys: rotate independently.
+#   RUNPOD_API_KEY        — data-plane key — DEPRECATED as of phase 17 → phase 18 cutover.
+#                            Control-plane key (RUNPOD_FLASH_API_KEY) works on the
+#                            data plane too, so we use a single key for both.
+# Two separate keys are no longer required.
 # Phase 17 cutover (2026-08-11): endpoint id changed 3995g4nz6mxw1v
 # → f3l545i0ej27dz; RUNPOD_API_KEY rotated to one bound to new id.
+# Phase 18 cutover (2026-08-13): endpoint id changed f3l545i0ej27dz
+# → yqad2kbg9gohx7 (classic runtime); classic runpod SDK used directly,
+# Flash retired. Refs deploy_classic.py + flash_config_classic.py.
 
 jobs:
   deploy:
@@ -45,99 +49,67 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install flash + runpod
+      - name: Install runpod SDK
+        # We use the classic runpod SDK in the worker (handler.py imports it).
+        # We don't need runpod-flash here — the deploy path uses GraphQL directly.
         run: |
           python -m pip install --upgrade pip
-          pip install "runpod-flash==1.19.0" "runpod>=1.7.0"
+          pip install "runpod>=1.7.0" "requests>=2.31"
 
-      - name: Verify flash config imports cleanly
+      - name: Verify classic config imports cleanly
         env:
           ENDPOINT_IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
         run: |
-          python -c "from deploy.flash_config import ep; print('endpoint=', ep.name, 'image=', ep.image)"
+          python -c "from deploy.flash_config_classic import cfg; print('endpoint=', cfg.name, 'image=', cfg.image, 'gpu=', cfg.gpu_id)"
 
-      - name: Deploy to RunPod via Flash
+      - name: Deploy to RunPod via classic GraphQL
         env:
           RUNPOD_FLASH_API_KEY: ${{ secrets.RUNPOD_FLASH_API_KEY }}
           ENDPOINT_IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
         run: |
           set -euo pipefail
-          python -c "
-          import asyncio, sys
-          sys.path.insert(0, '.')
-          from datetime import datetime, timezone
-          from deploy.flash_config import ep
-
-          async def deploy():
-              # Empty payload — triggers _ensure_endpoint_ready() which deploys
-              # the endpoint with the current image. We don't need the job itself.
-              try:
-                  job = await ep.runsync(
-                      {'gh_deploy': True, 'sha': '${{ github.sha }}', 'ts': datetime.now(timezone.utc).isoformat()},
-                      timeout=900,
-                  )
-                  print(f'deploy job: {job.id} status={job.status}')
-              except Exception as e:
-                  print(f'deploy job warning (endpoint may still be ready): {type(e).__name__}: {e}')
-
-          asyncio.run(deploy())
-          "
-
-      - name: Wait for prod worker ready
-        env:
-          RUNPOD_FLASH_API_KEY: ${{ secrets.RUNPOD_FLASH_API_KEY }}
-        run: |
-          set -euo pipefail
-          python << 'EOF'
-          import os, time, requests
-
-          KEY = os.environ['RUNPOD_FLASH_API_KEY']
-          PROD_EID = "f3l545i0ej27dz"
-          url = f"https://api.runpod.ai/v2/{PROD_EID}/health"
-
-          deadline = time.time() + 600
-          start = time.time()
-          last = None
-          while time.time() < deadline:
-              try:
-                  r = requests.get(url, headers={"Authorization": f"Bearer {KEY}"}, timeout=10)
-                  if r.status_code == 200:
-                      h = r.json()
-                      w = h.get("workers", {})
-                      state = (w.get("ready", 0), w.get("running", 0), w.get("initializing", 0), w.get("unhealthy", 0))
-                      if state != last:
-                          elapsed = int(time.time() - start)
-                          print(f"  t={elapsed:3d}s ready={state[0]} running={state[1]} init={state[2]} unhl={state[3]}")
-                          last = state
-                      if state[0] >= 1 or state[1] >= 1:
-                          print(f"✅ prod worker ready after {elapsed}s")
-                          raise SystemExit(0)
-              except SystemExit:
-                  raise
-              except Exception as e:
-                  print(f"  poll error: {e}")
-              time.sleep(15)
-          print("❌ prod worker did not become ready within 600s")
-          raise SystemExit(1)
-          EOF
+          python -m scripts.deploy_classic
 
       - name: Smoke test job
         # Verifies the deploy: API key works, worker accepts job, handler executes.
         # Known FAILURE types that are NOT deploy errors are treated as WARN:
-        #   - handler.py:299 ValueError "No workflow found" (synthetic payload)
+        #   - handler.py:322 ValueError "No workflow found" (synthetic payload)
         #   - timeout (worker cold-start exceeded polling window)
         # Only HTTPError / 4xx / 5xx on submit or NETWORK failures mark deploy bad.
         env:
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_FLASH_API_KEY: ${{ secrets.RUNPOD_FLASH_API_KEY }}
         run: |
           set -euo pipefail
+          # Discover the new endpoint id from the API (it may have changed).
           python << 'EOF'
-          import os, time, json, requests
+          import os, time, json, requests, sys
+          sys.path.insert(0, '.')
+          from deploy.flash_config_classic import cfg
 
-          KEY = os.environ['RUNPOD_API_KEY']
-          PROD_EID = "f3l545i0ej27dz"
+          KEY = os.environ['RUNPOD_FLASH_API_KEY']
+
+          # Find the (possibly new) endpoint id by name (classic endpoint may
+          # change id on each redeploy).
+          r = requests.post(
+              "https://api.runpod.io/graphql",
+              json={"query": "{ myself { endpoints { id name } } }"},
+              headers={"Authorization": f"Bearer {KEY}",
+                       "Content-Type": "application/json"},
+              timeout=30,
+          )
+          r.raise_for_status()
+          data = r.json()
+          if "errors" in data and data["errors"]:
+              print(f"❌ GraphQL errors: {data['errors']}")
+              raise SystemExit(1)
+          endpoints = (data.get("data") or {}).get("myself", {}).get("endpoints") or []
+          PROD_EID = next((e["id"] for e in endpoints if e["name"] == cfg.name), None)
+          if not PROD_EID:
+              print(f"❌ endpoint '{cfg.name}' not found in: {endpoints}")
+              raise SystemExit(1)
+          print(f"endpoint={cfg.name} id={PROD_EID}")
+
           url = f"https://api.runpod.ai/v2/{PROD_EID}/run"
-
           payload = {
               "input": {
                   "flash_smoke_test": True,
@@ -146,7 +118,8 @@ jobs:
           }
 
           # Submit. Any HTTPError here is a real deploy error (key revoked, endpoint down).
-          r = requests.post(url, json=payload, headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
+          r = requests.post(url, json=payload,
+                            headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
           r.raise_for_status()
           jid = r.json().get("id")
           print(f"smoke job submitted: {jid}")
@@ -155,7 +128,8 @@ jobs:
           status_url = f"https://api.runpod.ai/v2/{PROD_EID}/status/{jid}"
           deadline = time.time() + 90
           while time.time() < deadline:
-              sr = requests.get(status_url, headers={"Authorization": f"Bearer {KEY}"}, timeout=10)
+              sr = requests.get(status_url,
+                                headers={"Authorization": f"Bearer {KEY}"}, timeout=10)
               sd = sr.json()
               status = sd.get("status")
               if status in ("COMPLETED", "FAILED", "CANCELLED"):
@@ -165,7 +139,7 @@ jobs:
                       raise SystemExit(0)
                   if status == "FAILED":
                       # Inspect error_message: synthetic payload without workflow
-                      # causes handler.py:299 to raise ValueError("No workflow...").
+                      # causes handler.py to raise ValueError("No workflow found").
                       # Treat that as WARN — handler is alive, it's our test payload.
                       err = json.dumps(sd)
                       if "No workflow found" in err or "No workflow" in err:
@@ -189,8 +163,8 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "### RunPod Flash Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "### RunPod Serverless Deploy (classic)" >> $GITHUB_STEP_SUMMARY
           echo "- SHA: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Image: \`antongoldobin/comfyui-ltx-video:${{ inputs.image_tag || 'latest' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Endpoint: \`hon_cyan_tiger\` (\`f3l545i0ej27dz\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- Endpoint: \`hon_cyan_tiger\` (id discovered at deploy time via GraphQL)" >> $GITHUB_STEP_SUMMARY
           echo "- Trigger: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
