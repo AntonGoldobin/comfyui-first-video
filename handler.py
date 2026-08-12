@@ -12,8 +12,28 @@ ComfyUI is started by start.sh as a background process.
 This script waits for ComfyUI to be fully ready BEFORE accepting jobs.
 """
 
-import asyncio
+# IMPORTANT: bridge env vars BEFORE `import runpod`. The runpod SDK reads
+# RUNPOD_POD_ID, RUNPOD_AI_API_KEY, and RUNPOD_WEBHOOK_GET_JOB at MODULE
+# IMPORT time (worker_state.WORKER_ID and rp_job.JOB_GET_URL are computed
+# once when those modules are first imported). If we set them after the
+# import, the constants are already wrong (random UUID instead of endpoint
+# id, JOB_GET_URL stuck at "$ID" placeholder).
 import os
+if not os.environ.get("RUNPOD_POD_ID") and os.environ.get("RUNPOD_ENDPOINT_ID"):
+    os.environ["RUNPOD_POD_ID"] = os.environ["RUNPOD_ENDPOINT_ID"]
+if not os.environ.get("RUNPOD_AI_API_KEY"):
+    for alt in ("RUNPOD_FLASH_API_KEY", "RUNPOD_SERVERLESS_API_KEY"):
+        if os.environ.get(alt):
+            os.environ["RUNPOD_AI_API_KEY"] = os.environ[alt]
+            break
+if not os.environ.get("RUNPOD_WEBHOOK_GET_JOB") and os.environ.get("RUNPOD_ENDPOINT_ID"):
+    eid = os.environ["RUNPOD_ENDPOINT_ID"]
+    # SDK uses .replace("$ID", WORKER_ID) — must be literal $ID, not $RUNPOD_POD_ID.
+    os.environ["RUNPOD_WEBHOOK_GET_JOB"] = (
+        f"https://api.runpod.ai/v2/{eid}/job-take/$ID"
+    )
+
+import asyncio
 import sys
 import json
 import time
@@ -57,30 +77,8 @@ DEFAULT_S3_ENDPOINT = os.environ.get('S3_ENDPOINT_URL')
 HISTORY_POLL_INTERVAL = int(os.environ.get("HISTORY_POLL_INTERVAL", 2000))  # ms
 HISTORY_TIMEOUT = int(os.environ.get("HISTORY_TIMEOUT", 600))  # seconds
 
-# RunPod serverless wiring for FLASH-deployed endpoints.
-# Classic RunPod serverless injects RUNPOD_POD_ID + RUNPOD_AI_API_KEY +
-# RUNPOD_WEBHOOK_GET_JOB at runtime; Flash only injects RUNPOD_ENDPOINT_ID
-# and the data-plane token. The runpod SDK 1.x worker model needs all three
-# to poll /job-take/{id} from api.runpod.ai. Bridge them so this image
-# works on BOTH classic and Flash endpoints.
-if not os.environ.get("RUNPOD_POD_ID") and os.environ.get("RUNPOD_ENDPOINT_ID"):
-    os.environ["RUNPOD_POD_ID"] = os.environ["RUNPOD_ENDPOINT_ID"]
-if not os.environ.get("RUNPOD_AI_API_KEY"):
-    for alt in ("RUNPOD_FLASH_API_KEY", "RUNPOD_SERVERLESS_API_KEY"):
-        if os.environ.get(alt):
-            os.environ["RUNPOD_AI_API_KEY"] = os.environ[alt]
-            break
-if not os.environ.get("RUNPOD_WEBHOOK_GET_JOB") and os.environ.get("RUNPOD_ENDPOINT_ID"):
-    eid = os.environ["RUNPOD_ENDPOINT_ID"]
-    os.environ["RUNPOD_WEBHOOK_GET_JOB"] = (
-        f"https://api.runpod.ai/v2/{eid}/job-take/$RUNPOD_POD_ID"
-    )
-logger.info(
-    "RUNPOD wiring: POD_ID=%s, AI_KEY=%s, WEBHOOK_GET_JOB=%s",
-    "set" if os.environ.get("RUNPOD_POD_ID") else "MISSING",
-    "set" if os.environ.get("RUNPOD_AI_API_KEY") else "MISSING",
-    os.environ.get("RUNPOD_WEBHOOK_GET_JOB", "MISSING"),
-)
+# RunPod env bridging is at the top of this file (before `import runpod`) so
+# the SDK captures the values at module-import time. Don't add it here.
 
 
 def _is_comfyui_process_alive() -> Optional[bool]:
