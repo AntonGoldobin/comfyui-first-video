@@ -323,10 +323,39 @@ class ComfyUIWorker:
                 "msg": "smoke test fast-path (Phase 19)",
             }
 
+        # Phase 26: list_nodes probe — runs ComfyUI /object_info so the
+        # caller can see which custom node classes are actually registered
+        # (no point waiting 12 min for an LTX job only to discover the
+        # node pack didn't install). Returns the count + a sample of class
+        # names so we can grep for LTXV* / VHS_*. Requires ComfyUI ready.
+        if job_input.get("list_nodes"):
+            logger.info(f"Job {job_id}: list_nodes probe — querying /object_info")
+            resp = await self.httpx_client.get(
+                f'{COMFY_HOST_URL}/object_info',
+                headers=get_api_headers(),
+            )
+            resp.raise_for_status()
+            info = resp.json()
+            classes = sorted(info.keys())
+            ltxv = [c for c in classes if c.startswith("LTXV")]
+            vhs = [c for c in classes if c.startswith("VHS_") or "VideoHelper" in c]
+            return {
+                "status": "ok",
+                "probe": "list_nodes",
+                "job_id": job_id,
+                "total_classes": len(classes),
+                "ltxv_count": len(ltxv),
+                "ltxv_classes": ltxv,
+                "vhs_count": len(vhs),
+                "vhs_classes": vhs,
+                "sample": classes[:20],
+            }
+
         # Fast-fail for missing workflow (saves 5-30s of ComfyUI startup
         # for malformed probes that don't set any probe flag).
         if not (job_input.get("workflow") or job_input.get("prompt")):
             recognized = {"flash_smoke_test", "dry_run", "ping", "healthcheck",
+                          "list_nodes",
                           "workflow", "prompt", "images", "s3Config"}
             raise ValueError(
                 f"No workflow found in job input. "
