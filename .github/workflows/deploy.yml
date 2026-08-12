@@ -124,9 +124,11 @@ jobs:
           jid = r.json().get("id")
           print(f"smoke job submitted: {jid}")
 
-          # Poll status up to 90s
+          # Poll status up to 600s (10 min) — workers cold-start under
+          # throttling can take 5-10 min before picking up the job
+          # (observed: smoke job a552bbde queued 522s before running).
           status_url = f"https://api.runpod.ai/v2/{PROD_EID}/status/{jid}"
-          deadline = time.time() + 90
+          deadline = time.time() + 600
           while time.time() < deadline:
               sr = requests.get(status_url,
                                 headers={"Authorization": f"Bearer {KEY}"}, timeout=10)
@@ -161,7 +163,7 @@ jobs:
               time.sleep(3)
 
           # Timeout — worker still cold-starting. Treat as WARN, not fail.
-          print(f"⚠️  smoke job did not complete within 90s — leaving queued: {jid}")
+          print(f"⚠️  smoke job did not complete within 600s — leaving queued: {jid}")
           raise SystemExit(0)
           EOF
 
