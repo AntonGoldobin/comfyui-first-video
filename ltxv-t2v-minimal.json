@@ -7,14 +7,14 @@
     },
     "40": {
         "inputs": {
-            "clip": ["10", 0],
+            "clip": ["10", 1],
             "text": "blurry, low resolution, pixelated, noisy, artifacts, distorted"
         },
         "class_type": "CLIPTextEncode"
     },
     "98": {
         "inputs": {
-            "clip": ["10", 0],
+            "clip": ["10", 1],
             "text": "A cinematic close-up of a woman walking through a rain-soaked neon alley at night, reflections shimmering on wet pavement, cinematic lighting, shallow depth of field, 35mm film grain"
         },
         "class_type": "CLIPTextEncode"
