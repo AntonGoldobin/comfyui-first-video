@@ -84,6 +84,7 @@
         "inputs": {
             "images": ["107", 0],
             "frame_rate": 25,
+            "loop_count": 0,
             "filename_prefix": "LTXV_Minimal",
             "format": "video/h264-mp4",
             "pix_fmt": "yuv420p",
