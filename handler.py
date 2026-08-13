@@ -407,11 +407,40 @@ class ComfyUIWorker:
                 ) if os.path.isdir("/runpod-volume/models") else None,
             }
 
+        # Phase 28i: bash_command probe — runs arbitrary shell command for
+        # diagnostics. Use sparingly. ComfyUI must be ready (not required).
+        if job_input.get("bash_command"):
+            cmd = job_input["bash_command"]
+            if not isinstance(cmd, str) or not cmd.strip():
+                return {"status": "error", "probe": "bash_command",
+                        "error": "bash_command must be a non-empty string"}
+            import asyncio
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+                return {
+                    "status": "ok",
+                    "probe": "bash_command",
+                    "job_id": job_id,
+                    "returncode": proc.returncode,
+                    "stdout": stdout.decode("utf-8", errors="replace"),
+                }
+            except asyncio.TimeoutError:
+                return {"status": "error", "probe": "bash_command",
+                        "error": "command timed out (60s)", "job_id": job_id}
+            except Exception as e:
+                return {"status": "error", "probe": "bash_command",
+                        "error": str(e), "job_id": job_id}
+
         # Fast-fail for missing workflow (saves 5-30s of ComfyUI startup
         # for malformed probes that don't set any probe flag).
         if not (job_input.get("workflow") or job_input.get("prompt")):
             recognized = {"flash_smoke_test", "dry_run", "ping", "healthcheck",
-                          "list_nodes", "bootstrap_models",
+                          "list_nodes", "bootstrap_models", "bash_command",
                           "workflow", "prompt", "images", "s3Config"}
             raise ValueError(
                 f"No workflow found in job input. "
