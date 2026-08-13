@@ -351,11 +351,67 @@ class ComfyUIWorker:
                 "sample": classes[:20],
             }
 
+        # Phase 28: bootstrap_models probe — runs download-models-ltx2.sh on
+        # demand. Use when the entrypoint-wrapper.sh cold-start bootstrap
+        # silently failed (or for fresh network volumes that haven't seen
+        # a cold start). Returns ls of model dirs + download log tail.
+        if job_input.get("bootstrap_models"):
+            logger.info(f"Job {job_id}: bootstrap_models — running download script")
+            import asyncio
+
+            async def run_bootstrap():
+                proc = await asyncio.create_subprocess_exec(
+                    "/usr/local/bin/download-models-ltx2.sh",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                stdout, _ = await proc.communicate()
+                return proc.returncode, stdout.decode("utf-8", errors="replace")
+
+            try:
+                rc, log = await run_bootstrap()
+            except Exception as e:
+                return {"status": "error", "probe": "bootstrap_models",
+                        "error": str(e), "job_id": job_id}
+
+            # After download, ls the model dirs
+            import os
+            def safe_ls(p):
+                if not os.path.isdir(p):
+                    return f"missing: {p}"
+                try:
+                    entries = os.listdir(p)
+                    return sorted(entries)
+                except Exception as e:
+                    return f"err: {e}"
+
+            return {
+                "status": "ok" if rc == 0 else "download-failed",
+                "probe": "bootstrap_models",
+                "job_id": job_id,
+                "returncode": rc,
+                "log_tail": log[-3000:] if log else "",
+                "models": {
+                    "checkpoints": safe_ls("/runpod-volume/models/checkpoints"),
+                    "text_encoders": safe_ls("/runpod-volume/models/text_encoders"),
+                    "latent_upscale_models": safe_ls("/runpod-volume/models/latent_upscale_models"),
+                    "vae": safe_ls("/runpod-volume/models/vae"),
+                    "diffusion_models": safe_ls("/runpod-volume/models/diffusion_models"),
+                },
+                "disk_usage_gb": round(
+                    sum(
+                        os.path.getsize(os.path.join(dp, f))
+                        for dp, _, fns in os.walk("/runpod-volume/models")
+                        for f in fns
+                    ) / 1e9, 2
+                ) if os.path.isdir("/runpod-volume/models") else None,
+            }
+
         # Fast-fail for missing workflow (saves 5-30s of ComfyUI startup
         # for malformed probes that don't set any probe flag).
         if not (job_input.get("workflow") or job_input.get("prompt")):
             recognized = {"flash_smoke_test", "dry_run", "ping", "healthcheck",
-                          "list_nodes",
+                          "list_nodes", "bootstrap_models",
                           "workflow", "prompt", "images", "s3Config"}
             raise ValueError(
                 f"No workflow found in job input. "

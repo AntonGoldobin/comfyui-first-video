@@ -15,8 +15,13 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes /comfyui/custom_nodes/ComfyUI-KJNodes && \
     cd /comfyui/custom_nodes/ComfyUI-KJNodes && git checkout main
 
+# Phase 28c: pin to known-good commit instead of master HEAD.
+# master moves and example_workflows reference classes that no longer exist
+# in current master (e.g. LTXVConditioning). Pinning makes the build
+# reproducible. Bump this commit when intentionally upgrading LTXV node pack.
+ARG LTXVIDEO_COMMIT=2e2ac81
 RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo /comfyui/custom_nodes/ComfyUI-LTXVideo && \
-    cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout master
+    cd /comfyui/custom_nodes/ComfyUI-LTXVideo && git checkout ${LTXVIDEO_COMMIT}
 
 RUN git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     cd /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && git checkout main
