@@ -212,17 +212,41 @@ if is_runpod_mounted; then
     echo "Network volume mounted at /runpod-volume"
     mkdir -p /runpod-volume/models/{vae,diffusion_models,text_encoders,loras,latent_upscale_models,checkpoints,output,temp}
 
+    # Phase 28o: ComfyUI scans $COMFYUI_DIR/models (== /runpod-volume/workspace/ComfyUI/models
+    # when --base-directory points there). The sombi base image rsyncs the network volume
+    # with empty placeholder dirs (e.g. checkpoints/ contains only "put_checkpoints_here"),
+    # which makes the [ ! -e ] check below a no-op — ComfyUI then sees empty checkpoint
+    # lists. Always replace placeholder dirs with symlinks to /runpod-volume/models/<name>.
     mkdir -p "$COMFYUI_DIR/models"
     for d in vae diffusion_models text_encoders loras latent_upscale_models checkpoints; do
-        if [ ! -e "$COMFYUI_DIR/models/$d" ]; then
-            ln -sf /runpod-volume/models/$d "$COMFYUI_DIR/models/$d"
+        TARGET="$COMFYUI_DIR/models/$d"
+        # Replace: if it's a directory (real or placeholder) with no real checkpoints,
+        # blow it away and symlink. If it's already a symlink, leave it.
+        if [ -L "$TARGET" ]; then
+            : # already a symlink, leave it
+        elif [ -d "$TARGET" ]; then
+            # If directory only contains placeholders like "put_checkpoints_here",
+            # treat as empty and replace. Otherwise leave alone (user-provided dir).
+            if [ -z "$(ls -A "$TARGET" 2>/dev/null | grep -v '^put_checkpoints_here$' | grep -v '^put_dragon_vae_here$' | grep -v '^put_t5_encoder_here$' | grep -v '^put_tiny_vae_here$' | grep -v '^put_clip_here$')" ]; then
+                echo "  $TARGET is empty placeholder — replacing with symlink to /runpod-volume/models/$d"
+                rm -rf "$TARGET"
+                ln -sf /runpod-volume/models/$d "$TARGET"
+            else
+                echo "  $TARGET has real content — leaving in place"
+            fi
+        else
+            ln -sf /runpod-volume/models/$d "$TARGET"
         fi
     done
     mkdir -p /runpod-volume/output /runpod-volume/temp
-    if [ ! -e "$COMFYUI_DIR/output" ]; then
+    if [ -L "$COMFYUI_DIR/output" ]; then
+        : # already a symlink, leave it
+    elif [ ! -e "$COMFYUI_DIR/output" ]; then
         ln -sf /runpod-volume/output "$COMFYUI_DIR/output"
     fi
-    if [ ! -e "$COMFYUI_DIR/temp" ]; then
+    if [ -L "$COMFYUI_DIR/temp" ]; then
+        : # already a symlink, leave it
+    elif [ ! -e "$COMFYUI_DIR/temp" ]; then
         ln -sf /runpod-volume/temp "$COMFYUI_DIR/temp"
     fi
 
