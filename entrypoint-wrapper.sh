@@ -225,9 +225,11 @@ if is_runpod_mounted; then
         if [ -L "$TARGET" ]; then
             : # already a symlink, leave it
         elif [ -d "$TARGET" ]; then
-            # If directory only contains placeholders like "put_checkpoints_here",
+            # If directory only contains placeholders (any file starting with "put_"
+            # is a sombi-base convention marker like put_text_encoder_files_here),
             # treat as empty and replace. Otherwise leave alone (user-provided dir).
-            if [ -z "$(ls -A "$TARGET" 2>/dev/null | grep -v '^put_checkpoints_here$' | grep -v '^put_dragon_vae_here$' | grep -v '^put_t5_encoder_here$' | grep -v '^put_tiny_vae_here$' | grep -v '^put_clip_here$')" ]; then
+            REAL_FILES=$(ls -A "$TARGET" 2>/dev/null | grep -v '^put_' || true)
+            if [ -z "$REAL_FILES" ]; then
                 echo "  $TARGET is empty placeholder — replacing with symlink to /runpod-volume/models/$d"
                 rm -rf "$TARGET"
                 ln -sf /runpod-volume/models/$d "$TARGET"
