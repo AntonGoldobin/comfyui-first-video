@@ -210,10 +210,10 @@ is_runpod_mounted() {
 
 if is_runpod_mounted; then
     echo "Network volume mounted at /runpod-volume"
-    mkdir -p /runpod-volume/models/{vae,diffusion_models,text_encoders,loras,latent_upscale_models,output,temp}
+    mkdir -p /runpod-volume/models/{vae,diffusion_models,text_encoders,loras,latent_upscale_models,checkpoints,output,temp}
 
     mkdir -p "$COMFYUI_DIR/models"
-    for d in vae diffusion_models text_encoders loras latent_upscale_models; do
+    for d in vae diffusion_models text_encoders loras latent_upscale_models checkpoints; do
         if [ ! -e "$COMFYUI_DIR/models/$d" ]; then
             ln -sf /runpod-volume/models/$d "$COMFYUI_DIR/models/$d"
         fi
@@ -225,6 +225,18 @@ if is_runpod_mounted; then
     if [ ! -e "$COMFYUI_DIR/temp" ]; then
         ln -sf /runpod-volume/temp "$COMFYUI_DIR/temp"
     fi
+
+    # Phase 27: bootstrap LTX-2 19b distilled models if missing.
+    # Idempotent — re-running a worker will skip files that already exist.
+    # First cold start will download ~68 GB on a fresh network volume.
+    # Re-disable via SKIP_DOWNLOAD=1 in endpoint env vars.
+    if [ -f /usr/local/bin/download-models-ltx2.sh ]; then
+        echo "=== Phase 27: ensure LTX-2 19b distilled models present ==="
+        SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-}" HF_TOKEN="${HF_TOKEN:-}" \
+            bash /usr/local/bin/download-models-ltx2.sh || \
+            echo "⚠️  model download failed (will continue; ComfyUI will fail on missing models)"
+    fi
+
     echo "Model + output dirs ready"
 else
     echo "WARNING: /runpod-volume not mounted, using local dirs (ephemeral)"

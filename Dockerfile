@@ -47,6 +47,7 @@ RUN mkdir -p /comfyui/models && \
     ln -sf /runpod-volume/models/text_encoders /comfyui/models/text_encoders && \
     ln -sf /runpod-volume/models/loras /comfyui/models/loras && \
     ln -sf /runpod-volume/models/latent_upscale_models /comfyui/models/latent_upscale_models && \
+    ln -sf /runpod-volume/models/checkpoints /comfyui/models/checkpoints && \
     ln -sf /runpod-volume/output /comfyui/output && \
     ln -sf /runpod-volume/temp /comfyui/temp
 
@@ -74,9 +75,10 @@ COPY handler.py /handler.py
 COPY api-workflow.json /api-workflow.json
 COPY workflow.json /workflow.json
 COPY entrypoint-wrapper.sh /usr/local/bin/entrypoint-wrapper.sh
+COPY download-models-ltx2.sh /usr/local/bin/download-models-ltx2.sh
 
 # Make scripts executable
-RUN chmod +x /handler.py /start.sh /usr/local/bin/entrypoint-wrapper.sh
+RUN chmod +x /handler.py /start.sh /usr/local/bin/entrypoint-wrapper.sh /usr/local/bin/download-models-ltx2.sh
 
 # =============================================================================
 # Environment variables
