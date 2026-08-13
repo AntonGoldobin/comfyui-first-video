@@ -94,7 +94,7 @@ ENV COMFY_API_AVAILABLE_MAX_RETRIES=300
 ENV COMFY_API_AVAILABLE_INTERVAL_MS=1000
 ENV COMFY_LOG_LEVEL=INFO
 ENV HISTORY_POLL_INTERVAL=2000
-ENV HISTORY_TIMEOUT=600
+ENV HISTORY_TIMEOUT=1800
 
 # =============================================================================
 # Use entrypoint-wrapper to bypass base image entrypoint entirely

@@ -58,7 +58,7 @@
         "inputs": {
             "width": 512,
             "height": 320,
-            "length": 97,
+            "length": 17,
             "batch_size": 1
         },
         "class_type": "EmptyLTXVLatentVideo"
