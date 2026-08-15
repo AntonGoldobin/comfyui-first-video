@@ -6,19 +6,25 @@
 #
 # Models required by ltx2-t2v-distilled.json (LTX-2 19b distilled):
 #   1. diffusion checkpoint: ltx-2-19b-distilled.safetensors           (~43 GB)
-#   2. text encoder:         gemma-3-12b-it-qat-q4_0-unquantized/       (~24 GB)
-#   3. latent upscaler:      ltx-2-spatial-upscaler-x2-1.0.safetensors  (~1 GB)
-#   4. audio VAE:            same as diffusion checkpoint (combined)
+#   2. text encoder:         Lightricks/LTX-2/text_encoder/            (~50 GB, Gemma 12B)
+#   3. text projection:      Lightricks/LTX-2/connectors/              (~3 GB)
+#   4. latent upscaler:      ltx-2-spatial-upscaler-x2-1.0.safetensors  (~1 GB)
 #
 # Folder layout (after symlinks in /comfyui/models/*):
 #   /runpod-volume/models/checkpoints/ltx-2-19b-distilled.safetensors
-#   /runpod-volume/models/text_encoders/gemma-3-12b-it-qat-q4_0-unquantized/
+#   /runpod-volume/models/text_encoders/Lightricks-LTX-2-text_encoder/
+#   /runpod-volume/models/text_encoders/Lightricks-LTX-2-connectors/
 #   /runpod-volume/models/latent_upscale_models/ltx-2-spatial-upscaler-x2-1.0.safetensors
 #
-# Total: ~68 GB. Network volume f3falnf3r0 is 200 GB.
+# Total: ~97 GB. Network volume f3falnf3r0 is 200 GB.
+#
+# Why Lightricks/LTX-2 subdirs instead of google/gemma-3-12b-it-qat-q4_0-unquantized:
+#   - google/gemma-3-12b-it-qat-q4_0-unquantized is a gated repo requiring license acceptance
+#   - Lightricks redistributes Gemma weights themselves (non-gated, same weights)
+#   - connectors/diffusion_pytorch_model.safetensors = text projection (Gemma → 768-dim)
 #
 # Env vars:
-#   HF_TOKEN: HuggingFace token for gated/private repos (none required here)
+#   HF_TOKEN: HuggingFace token (recommended — anonymous downloads may rate-limit)
 #   SKIP_DOWNLOAD=1: skip downloads (for testing/scripts)
 #   MODELS_DIR: override target dir (default /runpod-volume/models)
 
@@ -68,56 +74,95 @@ fetch "ltx-2-19b-distilled checkpoint" \
     "$MODELS_DIR/checkpoints/ltx-2-19b-distilled.safetensors" \
     40000000000
 
-# 2. Gemma 3 12B IT QAT text encoder (multi-file, ~24 GB total)
-# Download via huggingface_hub mirror — single command clones the
-# subfolder only. The workflow expects model-00001-of-00005.safetensors
-# so we need the whole directory.
+# 2. Gemma 3 12B IT text encoder (~50 GB total, from Lightricks/LTX-2/text_encoder/)
+# Lightricks redistributes Gemma 12B themselves at this path — same weights as
+# the gated google/gemma-3-12b-it-qat-q4_0-unquantized but non-gated (no license
+# acceptance required). Files include diffusion_pytorch_model-*.safetensors +
+# model.safetensors.index.json + config.json + tokenizer/ side files.
+# Tokenizer is in a separate HF subdir (Lightricks/LTX-2/tokenizer/) but
+# CLIPLoader(type=ltxv) expects it alongside the model — download both into
+# the same local dir so they're discoverable.
 if [ -z "${SKIP_DOWNLOAD:-}" ] || [ "$SKIP_DOWNLOAD" != "1" ]; then
-    GEMMA_DIR="$MODELS_DIR/text_encoders/gemma-3-12b-it-qat-q4_0-unquantized"
-    if [ -f "$GEMMA_DIR/model-00001-of-00005.safetensors" ] && \
-       [ "$(stat -c%s "$GEMMA_DIR/model-00001-of-00005.safetensors" 2>/dev/null || stat -f%z "$GEMMA_DIR/model-00001-of-00005.safetensors" 2>/dev/null)" -gt 4000000000 ]; then
-        echo "  ✓ Gemma 3 12B already present"
+    GEMMA_DIR="$MODELS_DIR/text_encoders/Lightricks-LTX-2-text_encoder"
+    if [ -f "$GEMMA_DIR/model.safetensors.index.json" ] && \
+       [ "$(stat -c%s "$GEMMA_DIR/diffusion_pytorch_model-00001-of-00012.safetensors" 2>/dev/null || stat -f%z "$GEMMA_DIR/diffusion_pytorch_model-00001-of-00012.safetensors" 2>/dev/null)" -gt 1000000000 ]; then
+        echo "  ✓ Gemma 3 12B (Lightricks mirror) already present"
     else
-        echo "  ⬇️  Gemma 3 12B IT QAT → $GEMMA_DIR"
+        echo "  �️  Gemma 3 12B (from Lightricks/LTX-2/text_encoder + tokenizer) → $GEMMA_DIR"
         mkdir -p "$GEMMA_DIR"
-        # Use python+httpx for parallel downloads since this is multi-file
-        python3 - <<'PYEOF' || echo "  ⚠️  python download failed, retrying via wget"
+        GEMMA_DIR="$GEMMA_DIR" python3 - <<'PYEOF' || echo "  �️  python download failed, retrying via wget"
 import os, sys
 from pathlib import Path
-out = Path(os.environ.get("GEMMA_DIR", "/runpod-volume/models/text_encoders/gemma-3-12b-it-qat-q4_0-unquantized"))
-repo = "google/gemma-3-12b-it-qat-q4_0-unquantized"
-files = [
-    "config.json", "generation_config.json", "model.safetensors.index.json",
-    "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json",
-    "model-00001-of-00005.safetensors",
-    "model-00002-of-00005.safetensors",
-    "model-00003-of-00005.safetensors",
-    "model-00004-of-00005.safetensors",
-    "model-00005-of-00005.safetensors",
-]
-out.mkdir(parents=True, exist_ok=True)
-import urllib.request
+out = Path(os.environ["GEMMA_DIR"])
 hdr = {}
 tok = os.environ.get("HF_TOKEN", "")
 if tok:
     hdr["Authorization"] = f"Bearer {tok}"
-for fn in files:
+
+# (HF subdir in repo, local filename) pairs — tokenizer goes into same local dir as text_encoder
+all_files = [
+    ("text_encoder", "config.json"),
+    ("text_encoder", "generation_config.json"),
+    ("text_encoder", "model.safetensors.index.json"),
+    ("text_encoder", "special_tokens_map.json"),
+    ("text_encoder", "diffusion_pytorch_model-00001-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00002-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00003-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00004-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00005-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00006-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00007-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00008-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00009-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00010-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00011-of-00012.safetensors"),
+    ("text_encoder", "diffusion_pytorch_model-00012-of-00012.safetensors"),
+    ("tokenizer", "added_tokens.json"),
+    ("tokenizer", "chat_template.jinja"),
+    ("tokenizer", "preprocessor_config.json"),
+    ("tokenizer", "processor_config.json"),
+    ("tokenizer", "special_tokens_map.json"),
+    ("tokenizer", "tokenizer.json"),
+    ("tokenizer", "tokenizer.model"),
+    ("tokenizer", "tokenizer_config.json"),
+]
+out.mkdir(parents=True, exist_ok=True)
+import urllib.request
+for subdir, fn in all_files:
     target = out / fn
-    if target.exists() and target.stat().st_size > 1_000_000:
+    if target.exists() and target.stat().st_size > 1_000:
         print(f"  ✓ {fn} already present")
         continue
-    url = f"https://huggingface.co/{repo}/resolve/main/{fn}"
+    url = f"https://huggingface.co/Lightricks/LTX-2/resolve/main/{subdir}/{fn}"
     print(f"  ⬇️  {fn}")
     req = urllib.request.Request(url, headers=hdr)
-    with urllib.request.urlopen(req, timeout=600) as r, open(target, "wb") as f:
-        while True:
-            chunk = r.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-    print(f"  ✓ {fn} done ({target.stat().st_size / 1e9:.2f} GB)")
+    try:
+        with urllib.request.urlopen(req, timeout=1200) as r, open(target, "wb") as f:
+            while True:
+                chunk = r.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        size_gb = target.stat().st_size / 1e9
+        print(f"  ✓ {fn} done ({size_gb:.2f} GB)")
+    except Exception as e:
+        print(f"  ✗ {fn} FAILED: {e}")
+        if target.exists():
+            target.unlink()
+        sys.exit(1)
 PYEOF
     fi
+fi
+
+# 2b. Text projection connector (~3 GB, from Lightricks/LTX-2/connectors/)
+# Maps Gemma 4096-dim hidden states to model's expected conditioning dim.
+# ComfyUI loads via CLIPLoader(type=ltxv) or as part of ModelSamplingLTXV.
+if [ -z "${SKIP_DOWNLOAD:-}" ] || [ "$SKIP_DOWNLOAD" != "1" ]; then
+    CONN_DIR="$MODELS_DIR/text_encoders/Lightricks-LTX-2-connectors"
+    fetch "Lightricks LTX-2 connector (text projection)" \
+        "https://huggingface.co/Lightricks/LTX-2/resolve/main/connectors/diffusion_pytorch_model.safetensors" \
+        "$CONN_DIR/diffusion_pytorch_model.safetensors" \
+        2500000000
 fi
 
 # 3. Spatial upscaler x2 v1.0 (~1 GB)
