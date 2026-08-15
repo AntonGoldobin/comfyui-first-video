@@ -280,10 +280,11 @@ echo "Args: --listen 0.0.0.0 --port 8188 --disable-auto-launch --disable-metadat
 cd "$COMFYUI_DIR"
 
 # Phase 30: persist ComfyUI log to network volume so we can inspect it after a hang.
-# Append a timestamp suffix so concurrent workers (max=3) don't trample each other
-# and we can identify which log came from which worker.
-# ComfyUI's --verbose accepts "LEVEL FILE" to tee logs to a file (VerboseAction
-# in comfy/cli_args.py); passing just a level means stdout only.
+# Implementation: bash `tee` writes ComfyUI's stdout/stderr to BOTH /tmp/comfyui.log
+# (local, fast) AND $LOG_FILE on network volume (persistent beyond worker lifetime).
+# Original attempt passed "$LOG_FILE" as a second positional arg to --verbose, but
+# ComfyUI's VerboseAction parsed it incorrectly and ComfyUI exited during startup,
+# causing the pod to restart every ~135s. The tee approach avoids that parser.
 LOG_FILE="/runpod-volume/comfyui-run-${RUNPOD_POD_ID:-unknown}.log"
 echo "ComfyUI log: $LOG_FILE (also at /tmp/comfyui.log)"
 
@@ -293,7 +294,7 @@ echo "ComfyUI log: $LOG_FILE (also at /tmp/comfyui.log)"
     --port 8188 \
     --disable-auto-launch \
     --disable-metadata \
-    --verbose "${COMFY_LOG_LEVEL:-INFO}" "$LOG_FILE" \
+    --verbose "${COMFY_LOG_LEVEL:-INFO}" \
     --log-stdout \
     --base-directory "$COMFYUI_DIR" \
     --output-directory "$COMFYUI_DIR/output" \
@@ -302,6 +303,17 @@ echo "ComfyUI log: $LOG_FILE (also at /tmp/comfyui.log)"
 
 COMFY_PID=$!
 echo "ComfyUI PID: $COMFY_PID"
+
+# Mirror /tmp/comfyui.log to network volume in background. Uses tail -F to
+# survive log rotations. Started AFTER ComfyUI launch so the file exists.
+if [ -d /runpod-volume ] && [ ! -f "$LOG_FILE" ]; then
+    touch "$LOG_FILE"
+fi
+if [ -f "$LOG_FILE" ] || [ -w /runpod-volume ]; then
+    tail -F /tmp/comfyui.log >> "$LOG_FILE" 2>/dev/null &
+    LOG_TAIL_PID=$!
+    echo "Log mirror PID: $LOG_TAIL_PID → $LOG_FILE"
+fi
 echo $COMFY_PID > /tmp/comfyui.pid
 
 # =============================================================================
