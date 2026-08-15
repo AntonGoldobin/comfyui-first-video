@@ -279,13 +279,21 @@ echo "Args: --listen 0.0.0.0 --port 8188 --disable-auto-launch --disable-metadat
 
 cd "$COMFYUI_DIR"
 
+# Phase 30: persist ComfyUI log to network volume so we can inspect it after a hang.
+# Append a timestamp suffix so concurrent workers (max=3) don't trample each other
+# and we can identify which log came from which worker.
+# ComfyUI's --verbose accepts "LEVEL FILE" to tee logs to a file (VerboseAction
+# in comfy/cli_args.py); passing just a level means stdout only.
+LOG_FILE="/runpod-volume/comfyui-run-${RUNPOD_POD_ID:-unknown}.log"
+echo "ComfyUI log: $LOG_FILE (also at /tmp/comfyui.log)"
+
 # shellcheck disable=SC2086
 "$PYTHON_BIN" main.py \
     --listen 0.0.0.0 \
     --port 8188 \
     --disable-auto-launch \
     --disable-metadata \
-    --verbose "${COMFY_LOG_LEVEL:-INFO}" \
+    --verbose "${COMFY_LOG_LEVEL:-INFO}" "$LOG_FILE" \
     --log-stdout \
     --base-directory "$COMFYUI_DIR" \
     --output-directory "$COMFYUI_DIR/output" \
@@ -377,8 +385,22 @@ fi
 echo "ComfyUI is ready at http://localhost:8188"
 
 # =============================================================================
-# START RunPod Serverless Handler
+# START RunPod Serverless Handler (unless --no-handler is set)
 # =============================================================================
+# Phase 30: --no-handler flag is for debug Pods (interactive ComfyUI testing).
+# handler.py launches a RunPod serverless worker that exits immediately on a
+# Pod (no RUNPOD_POD_ID env var wired to a serverless endpoint), which would
+# restart the container and cut off browser access every ~30s. When set, we
+# exec sleep infinity to keep the container alive so the user can interact
+# with ComfyUI at port 8188 indefinitely.
+#
+# Triggered by RunPod Pod dockerArgs: "--no-handler"
+if [ "${1:-}" = "--no-handler" ]; then
+    echo ""
+    echo "=== --no-handler flag set — ComfyUI is up, keeping pod alive ==="
+    exec sleep infinity
+fi
+
 echo ""
 echo "=== Starting RunPod Serverless Handler ==="
 cd /
