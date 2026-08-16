@@ -421,7 +421,11 @@ class ComfyUIWorker:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+                # Phase 30: 60s was too short for Gemma shard downloads (~50GB,
+                # ~5-10 min even at gigabit). Bumped to 1800s (30 min) — fits
+                # bootstrap_models + full Gemma pull comfortably. Probe jobs
+                # (flash_smoke_test etc.) are still under 5s.
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1800)
                 return {
                     "status": "ok",
                     "probe": "bash_command",
@@ -431,7 +435,7 @@ class ComfyUIWorker:
                 }
             except asyncio.TimeoutError:
                 return {"status": "error", "probe": "bash_command",
-                        "error": "command timed out (60s)", "job_id": job_id}
+                        "error": "command timed out (1800s)", "job_id": job_id}
             except Exception as e:
                 return {"status": "error", "probe": "bash_command",
                         "error": str(e), "job_id": job_id}

@@ -104,7 +104,8 @@ all_files = [
     ("text_encoder", "config.json"),
     ("text_encoder", "generation_config.json"),
     ("text_encoder", "model.safetensors.index.json"),
-    ("text_encoder", "special_tokens_map.json"),
+    # NOTE: special_tokens_map.json is NOT in text_encoder/ on Lightricks/LTX-2
+    # (it lives in tokenizer/). Skip to avoid HTTP 404 aborting the whole run.
     ("text_encoder", "diffusion_pytorch_model-00001-of-00012.safetensors"),
     ("text_encoder", "diffusion_pytorch_model-00002-of-00012.safetensors"),
     ("text_encoder", "diffusion_pytorch_model-00003-of-00012.safetensors"),
@@ -146,10 +147,10 @@ for subdir, fn in all_files:
         size_gb = target.stat().st_size / 1e9
         print(f"  ✓ {fn} done ({size_gb:.2f} GB)")
     except Exception as e:
-        print(f"  ✗ {fn} FAILED: {e}")
+        print(f"  ✗ {fn} FAILED: {e} (continuing with next file)")
         if target.exists():
             target.unlink()
-        sys.exit(1)
+        continue
 PYEOF
     fi
 fi
