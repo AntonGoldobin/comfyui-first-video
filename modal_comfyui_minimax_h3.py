@@ -51,29 +51,43 @@ image = (
         "python3 -m pip install --no-cache-dir --break-system-packages pip setuptools wheel || true",
     )
     .run_commands(
+        # REPLACE sombi's frozen ComfyUI v0.18.1 with a fresh clone of v0.33.2.
+        # Why: v0.18.1 lacks the comfy.ldm.minimax module that provides the local
+        # MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo nodes. We need v0.30+
+        # (we pin v0.33.2 = latest stable as of 2026-08-20) for native H3 support.
+        "rm -rf /ComfyUI",
+        "git clone --depth=1 --branch v0.33.2 https://github.com/comfyanonymous/ComfyUI /ComfyUI",
+    )
+    .run_commands(
+        # Install fresh ComfyUI's base requirements (replaces sombi's frozen /venv pkgs
+        # with whatever v0.33.2 needs).
+        "pip install --no-cache-dir -r /ComfyUI/requirements.txt",
+    )
+    .run_commands(
         # Custom nodes for H3:
         # - ComfyUI-Easy-Use: provides easy loadImageBase64 (node 220 in our workflow)
-        # - ComfyUI-KJNodes: ImageResizeKJv2 (node 170 in our workflow)
-        # - ComfyUI-LTXVideo: MiniMaxH3SigmaShift (node 222) — same pack ships H3 nodes
+        # - ComfyUI-KJNodes: PatchSageAttentionKJ (recommended for H3 speedup, per
+        #   https://docs.comfy.org/tutorials/video/minimax/minimax-h3) + ImageResizeKJv2
+        # - ComfyUI-LTXVideo: MiniMaxH3SigmaShift (H3 sigma-shift helper node)
         "rm -rf /ComfyUI/custom_nodes/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
         "git clone --depth=1 https://github.com/yolain/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-Easy-Use",
         "git clone --depth=1 https://github.com/kijai/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-KJNodes",
         "git clone --depth=1 https://github.com/Lightricks/ComfyUI-LTXVideo /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
     )
     .run_commands(
-        # Install ComfyUI deps + custom node deps
-        "cd /ComfyUI && "
-        "for r in custom_nodes/*/requirements.txt; do "
+        # Install custom node deps
+        "for r in /ComfyUI/custom_nodes/*/requirements.txt; do "
         "[ -f \"$r\" ] && pip install --no-cache-dir -r \"$r\" || true; "
         "done",
         "pip install --no-cache-dir opencv-python imageio_ffmpeg",
         # ASGI proxy deps (serve() uses FastAPI + httpx)
         "pip install --no-cache-dir fastapi httpx 'starlette>=0.36'",
-        # sombi base ships with CUDA 13 versions of transformers/torchaudio which
-        # fail with libcudart.so.12 (sombi actually has CUDA 12.8 + torch 2.8.0+cu128).
-        # Pin to CUDA 12-compatible versions. ComfyUI-LTXVideo imports v0.34+ of
-        # both transitively via MiniMaxH3SigmaShift and similar custom nodes.
-        "pip install --no-cache-dir transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
+        # Sage attention — soft requirement for MiniMax H3 (recommended in docs.comfy.org).
+        # Falls back gracefully if not installed; we install it for the perf boost.
+        "pip install --no-cache-dir --break-system-packages sageattention || true",
+        # Pin transformers/torchaudio/huggingface_hub to CUDA 12-compatible versions
+        # (sombi base ships v5.x which conflicts with comfy.ldm.minimax imports).
+        "pip install --no-cache-dir --break-system-packages transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
     )
     .entrypoint([])  # disable base image entrypoint; we start ComfyUI ourselves
 )
