@@ -337,5 +337,265 @@ def serve():
 @app.local_entrypoint()
 def main():
     log.info("=== Modal ComfyUI H3 app ===")
-    log.info("Setup models: modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx")
-    log.info("Deploy:      modal deploy modal_comfyui_minimax_h3.py")
+    log.info("Setup models:  modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx")
+    log.info("Setup Civitai LoRA: modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli --model-id N --version-id N --file-id N --target-path models/loras/X.safetensors --sha256 ... --civitai-api-key KEY")
+    log.info("Deploy:        modal deploy modal_comfyui_minimax_h3.py")
+
+
+# =============================================================================
+# Setup job: drop a Civitai LoRA into the same h3_models_volume
+# =============================================================================
+# Idempotent: if the destination already exists AND the SHA256 matches, exits OK.
+# Re-running after the file is in place is a no-op (saves the 296 MB re-download).
+#
+# Why a separate function (vs adding to setup_minimax_h3_models):
+#   - HuggingFace setup is large (~30 GB, 2-hour timeout). Adding/removing a
+#     LoRA should NOT trigger re-download of the whole base model set.
+#   - Idempotency contract differs: HF files are size-gated; LoRAs need
+#     SHA256 verification (community uploads can drift).
+# =============================================================================
+
+CHUNK_SIZE_LORA = 8 * 1024 * 1024  # 8 MiB
+
+
+def _sha256_file(path: str, chunk: int = 8 * 1024 * 1024) -> str:
+    import hashlib as _hashlib
+
+    h = _hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest().upper()
+
+
+@app.function(
+    image=image,
+    volumes={"/modal-data": h3_models_volume},
+    cpu=2,
+    memory=4096,
+    timeout=900,
+    startup_timeout=600,
+)
+def setup_civitai_lora(
+    model_id: int,
+    version_id: int,
+    file_id: int,
+    target_path: str,
+    sha256: str,
+    civitai_api_key: str = "",
+) -> dict:
+    """Download a Civitai LoRA into the shared Modal Volume.
+
+    Parameters
+    ----------
+    model_id, version_id, file_id
+        Civitai identifiers — assembled from ``describe-lora`` manifest.
+    target_path
+        Path relative to the ComfyUI models root, e.g.
+        ``"models/loras/MM-H3 - Blowjob v2.1.safetensors"``. The
+        absolute destination is ``/modal-data/<target_path>``.
+    sha256
+        Expected SHA256 (uppercase hex, 64 chars). Verified after
+        download; mismatch aborts and removes the partial file.
+    civitai_api_key
+        Bearer token. Required for NSFW or rate-limited public models.
+        Read from env var CIVITAI_API_KEY if not passed.
+
+    Returns
+    -------
+    dict with status, bytes written, sha256 (computed), path.
+    """
+    import urllib.request
+
+    expected_sha = sha256.strip().upper()
+    assert len(expected_sha) == 64, f"sha256 must be 64 hex chars, got {len(expected_sha)}"
+    target_path = target_path.lstrip("/")
+    dst = f"/modal-data/{target_path}"
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+    # Idempotency: file present + sha matches → done
+    if os.path.exists(dst):
+        h = _sha256_file(dst)
+        if h == expected_sha:
+            sz = os.path.getsize(dst)
+            log.info(
+                f"setup_civitai_lora: {target_path} already present "
+                f"({sz / 1e6:.1f} MB, sha256 OK)"
+            )
+            return {
+                "status": "ok_already_present",
+                "path": target_path,
+                "sizeBytes": sz,
+                "sha256": h,
+                "modelId": model_id,
+                "versionId": version_id,
+            }
+        log.warning(
+            f"setup_civitai_lora: {target_path} present but sha mismatch "
+            f"(have {h[:12]}… want {expected_sha[:12]}…) — re-downloading"
+        )
+        os.unlink(dst)
+
+    api_key = civitai_api_key or os.environ.get("CIVITAI_API_KEY", "")
+    download_url = (
+        f"https://civitai.com/api/download/models/{version_id}?fileId={file_id}"
+    )
+    # Cloudflare in front of Civitai returns a 403 HTML challenge for the
+    # default `Python-urllib/x.y` User-Agent. Mimic curl to be allowed.
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "curl/8.7.1",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    from urllib.parse import urlparse
+
+    # Manual redirect loop — urllib's default HTTPRedirectHandler leaks
+    # the original Authorization header to the redirected host (R2), which
+    # then returns 400 "Missing x-amz-content-sha256" because its signed-URL
+    # auth scheme rejects the leaked Bearer token.
+    #
+    # Solution: install an opener with a redirect handler that RE-RAISES
+    # 30x as HTTPError with the Location header preserved, so urlopen
+    # doesn't auto-follow. Our manual loop then follows with the right
+    # headers (auth stripped on cross-host).
+    class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
+        def http_error_301(self, req, fp, code, msg, headers):
+            return self._raise(req, fp, code, msg, headers)
+        def http_error_302(self, req, fp, code, msg, headers):
+            return self._raise(req, fp, code, msg, headers)
+        def http_error_303(self, req, fp, code, msg, headers):
+            return self._raise(req, fp, code, msg, headers)
+        def http_error_307(self, req, fp, code, msg, headers):
+            return self._raise(req, fp, code, msg, headers)
+        def http_error_308(self, req, fp, code, msg, headers):
+            return self._raise(req, fp, code, msg, headers)
+        def _raise(self, req, fp, code, msg, headers):
+            # Preserve headers on the HTTPError so caller can read Location
+            err = urllib.error.HTTPError(
+                req.full_url, code, msg, headers, fp
+            )
+            raise err
+
+    opener = urllib.request.build_opener(_NoFollowRedirect())
+
+    current_url = download_url
+    current_headers = dict(headers)
+    response = None
+    try:
+        for hop in range(5):  # max 5 hops, Civitai → R2 should be 1
+            req = urllib.request.Request(current_url, headers=current_headers)
+            try:
+                response = opener.open(req, timeout=7200)
+                # 2xx — done
+                break
+            except urllib.error.HTTPError as e:
+                if e.code not in (301, 302, 303, 307, 308):
+                    raise RuntimeError(
+                        f"HTTP {e.code} from {current_url}: {e.reason}"
+                    ) from e
+                location = e.headers.get("Location")
+                if not location:
+                    raise RuntimeError(
+                        f"HTTP {e.code} from {current_url} with no Location"
+                    ) from e
+                # Cross-host: strip Authorization (R2 uses its own sig).
+                new_host = urlparse(location).netloc
+                old_host = urlparse(current_url).netloc
+                if new_host != old_host:
+                    current_headers = {
+                        k: v for k, v in current_headers.items()
+                        if k != "Authorization"
+                    }
+                current_url = location
+                log.info(
+                    f"setup_civitai_lora: redirect hop {hop} → "
+                    f"{urlparse(location).netloc}"
+                )
+                continue
+
+        if response is None or response.status != 200:
+            raise RuntimeError(f"unexpected final status from {current_url}")
+        log.info(f"setup_civitai_lora: downloading {current_url}")
+
+        tmp_path = f"{dst}.part"
+        total = int(response.headers.get("Content-Length", "0") or 0)
+        written = 0
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = response.read(CHUNK_SIZE_LORA)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+                if total and written % (32 * CHUNK_SIZE_LORA) < CHUNK_SIZE_LORA:
+                    pct = 100 * written / total
+                    log.info(
+                        f"setup_civitai_lora: {target_path} "
+                        f"{written / 1e6:.1f}/{total / 1e6:.1f} MB ({pct:.1f}%)"
+                    )
+        response.close()
+    except Exception as e:
+        if os.path.exists(f"{dst}.part"):
+            os.unlink(f"{dst}.part")
+        raise RuntimeError(f"download failed: {e}") from e
+
+    computed = _sha256_file(tmp_path)
+    if computed != expected_sha:
+        os.unlink(tmp_path)
+        raise RuntimeError(
+            f"sha256 mismatch: computed {computed[:12]}…, expected {expected_sha[:12]}…"
+        )
+
+    os.replace(tmp_path, dst)
+    sz = os.path.getsize(dst)
+    h3_models_volume.commit()
+    log.info(
+        f"setup_civitai_lora: committed {target_path} "
+        f"({sz / 1e6:.1f} MB, sha256 OK)"
+    )
+
+    return {
+        "status": "ok_downloaded",
+        "path": target_path,
+        "sizeBytes": sz,
+        "sha256": computed,
+        "modelId": model_id,
+        "versionId": version_id,
+    }
+
+
+@app.local_entrypoint()
+def setup_civitai_lora_cli(
+    model_id: int,
+    version_id: int,
+    file_id: int,
+    target_path: str,
+    sha256: str,
+    civitai_api_key: str = "",
+) -> None:
+    """CLI entrypoint. Invoked as::
+
+        modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli \\
+            --model-id 2845331 --version-id 3235946 \\
+            --file-id 3118341 \\
+            --target-path "models/loras/MM-H3 - Blowjob v2.1.safetensors" \\
+            --sha256 AEF6D0C6B758352FD4CFE302D3B9121FB0C18E470BDE4BDB2025229E1FEBEE6D \\
+            --civitai-api-key "$CIVITAI_API_KEY"
+    """
+    import json as _json
+
+    result = setup_civitai_lora.remote(
+        model_id=model_id,
+        version_id=version_id,
+        file_id=file_id,
+        target_path=target_path,
+        sha256=sha256,
+        civitai_api_key=civitai_api_key,
+    )
+    print(_json.dumps(result, indent=2))
