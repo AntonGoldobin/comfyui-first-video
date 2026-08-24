@@ -47,7 +47,9 @@ image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
     .run_commands(
         # Install git + python3 (sombi base uses uv-managed Python, not /usr/bin/python3)
-        "apt-get update && apt-get install -y --no-install-recommends git wget ca-certificates python3 python3-venv python3-pip && rm -rf /var/lib/apt/lists/*",
+        # build-essential + cmake: needed by comfyui-reactor v0.6.x's insightface
+        # (compiles C++ bindings from source if no prebuilt wheel).
+        "apt-get update && apt-get install -y --no-install-recommends git wget ca-certificates python3 python3-venv python3-pip build-essential cmake && rm -rf /var/lib/apt/lists/*",
         "python3 -m pip install --no-cache-dir --break-system-packages pip setuptools wheel || true",
     )
     .run_commands(
@@ -69,10 +71,14 @@ image = (
         # - ComfyUI-KJNodes: PatchSageAttentionKJ (recommended for H3 speedup, per
         #   https://docs.comfy.org/tutorials/video/minimax/minimax-h3) + ImageResizeKJv2
         # - ComfyUI-LTXVideo: MiniMaxH3SigmaShift (H3 sigma-shift helper node)
-        "rm -rf /ComfyUI/custom_nodes/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
+        # - ComfyUI-ReActor: face-swap post-process (inserted between VAEDecode and
+        #   CreateVideo). Uses reswapper_256.onnx (MIT-licensed, no InsightFace
+        #   commercial license trap). Latest stable tag is v0.6.2.
+        "rm -rf /ComfyUI/custom_nodes/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-LTXVideo /ComfyUI/custom_nodes/comfyui-reactor",
         "git clone --depth=1 https://github.com/yolain/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-Easy-Use",
         "git clone --depth=1 https://github.com/kijai/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-KJNodes",
         "git clone --depth=1 https://github.com/Lightricks/ComfyUI-LTXVideo /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
+        "git clone --depth=1 --branch v0.6.2 https://github.com/Gourieff/comfyui-reactor /ComfyUI/custom_nodes/comfyui-reactor",
     )
     .run_commands(
         # Install custom node deps
@@ -255,8 +261,8 @@ def serve():
             shutil.copy2(src, dst)
             log.info(f"Copied ({os.path.getsize(dst)/1e9:.2f} GB)")
 
-    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/
-    for sub in ("diffusion_models", "text_encoders", "vae", "loras"):
+    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/, insightface/, reswapper/
+    for sub in ("diffusion_models", "text_encoders", "vae", "loras", "insightface", "reswapper"):
         os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
         copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
 
@@ -338,6 +344,7 @@ def serve():
 def main():
     log.info("=== Modal ComfyUI H3 app ===")
     log.info("Setup models:  modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx")
+    log.info("Setup ReActor: modal run modal_comfyui_minimax_h3.py::setup_reactor_models_cli")
     log.info("Setup Civitai LoRA: modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli --model-id N --version-id N --file-id N --target-path models/loras/X.safetensors --sha256 ... --civitai-api-key KEY")
     log.info("Deploy:        modal deploy modal_comfyui_minimax_h3.py")
 
@@ -598,4 +605,86 @@ def setup_civitai_lora_cli(
         sha256=sha256,
         civitai_api_key=civitai_api_key,
     )
+    print(_json.dumps(result, indent=2))
+
+
+# =============================================================================
+# Setup job: download ReActor face-swap models to Modal Volume
+# =============================================================================
+# Single file (~280 MB): reswapper_256.onnx
+# - MIT-licensed (NOT InsightFace buffalo_l, which is research-only)
+# - 256px crop → better on H3's 1344×768 output frames than reswapper_128
+# - Drop-in via ReActor's swap_model dropdown
+#
+# Why separate function: idempotent, fast (~5 min cold download), doesn't
+# require HF token. Re-running is a no-op.
+# =============================================================================
+
+
+@app.function(
+    image=image,
+    volumes={"/modal-data": h3_models_volume},
+    cpu=2,
+    memory=4096,
+    timeout=900,
+    startup_timeout=600,
+)
+def setup_reactor_models() -> dict:
+    """Download ReActor face-swap model to Modal Volume. Idempotent.
+
+    Files (~280 MB total):
+      - reswapper_256.onnx  → /modal-data/models/reswapper/reswapper_256.onnx
+
+    ReActor's swap_model dropdown reads from ComfyUI/models/reswapper/
+    at runtime; copy_dir_contents() in serve() mirrors
+    /modal-data/models/reswapper/ → /ComfyUI/models/reswapper/.
+    """
+    import urllib.request
+
+    dst_dir = "/modal-data/models/reswapper"
+    os.makedirs(dst_dir, exist_ok=True)
+
+    REACTOR_FILES = [
+        (
+            "reswapper_256.onnx",
+            f"{dst_dir}/reswapper_256.onnx",
+            "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/reswapper_256.onnx",
+            250_000_000,
+        ),
+    ]
+
+    log.info("=== Downloading ReActor face-swap models (~280 MB) ===")
+    for name, dst, url, expected_min in REACTOR_FILES:
+        if os.path.exists(dst) and os.path.getsize(dst) > expected_min * 0.95:
+            log.info(f"{name}: already present ({os.path.getsize(dst) / 1e6:.1f} MB)")
+            continue
+        log.info(f"Downloading {name} from {url}")
+        req = urllib.request.Request(url)
+        try:
+            with urllib.request.urlopen(req, timeout=7200) as r, open(dst, "wb") as f:
+                while True:
+                    chunk = r.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            log.info(f"{name}: done ({os.path.getsize(dst) / 1e6:.1f} MB)")
+        except Exception as e:
+            if os.path.exists(dst):
+                os.unlink(dst)
+            log.error(f"Failed to download {name}: {e}")
+            raise
+
+    h3_models_volume.commit()
+    return {"status": "ok", "files": len(REACTOR_FILES)}
+
+
+@app.local_entrypoint()
+def setup_reactor_models_cli() -> None:
+    """CLI entrypoint. Invoked as::
+
+        modal run modal_comfyui_minimax_h3.py::setup_reactor_models_cli
+    """
+    import json as _json
+
+    result = setup_reactor_models.remote()
     print(_json.dumps(result, indent=2))
