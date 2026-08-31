@@ -153,6 +153,13 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
             "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
             100_000_000,
         ),
+        # Mystic XXX — community style LoRA for H3 (lynaNSFW/mysticxxx_MM_H3, V4 pruned)
+        # strength_model 0.5-0.9; stacks after Turbo. See lynaNSFW HF repo for trigger guidance.
+        (
+            "loras/MysticXXX_MMH3-V4.safetensors",
+            "https://huggingface.co/lynaNSFW/mysticxxx_MM_H3/resolve/main/MysticXXX_MMH3-V4.safetensors",
+            100_000_000,
+        ),
     ]
 
     log.info("=== Downloading MiniMax-H3 model set (~30 GB) ===")
@@ -190,8 +197,38 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     cpu=4,
     memory=16384,
     timeout=1800,
-    scaledown_window=300,
+    # Modal-native autoscaler (B0, 2026-08-31) — replaces B3 prewarm cron.
+    # Prewarm approach failed: cron scheduler's own ping can hit cold ASGI
+    # (30-120s timeout < 110s cold start) AND depends on httpx in default
+    # image. Modal's built-in autoscaler handles these correctly:
+    #   - min_containers=0      → no idle cost
+    #   - scaledown_window=60   → die fast when idle (was 300)
+    #   - max_containers=20     → ceiling under burst
+    #   - buffer_containers=1   → 1 extra ready, no cold-start on burst
+    # NOTE: `scaleup_window` is NOT a valid Modal SDK param — Modal's
+    # built-in autoscaler reacts to demand growth without a tunable delay.
+    # (User template included it; removed 2026-08-31.)
+    #
+    # Memory snapshot (B1, 2026-08-31) — Modal-native checkpoint/restore.
+    # Snapshot is taken after `serve()` body finishes init (model copy +
+    # ComfyUI start). Subsequent cold starts restore from snapshot, skipping
+    # the 60s model copy + 30s ComfyUI init. Reduces cold start from ~90s
+    # to <10s (per Modal docs, up to 12x speedup observed). GPU memory
+    # snapshots are maturing (CPU GA; GPU stable on A100 per 2026-08 docs).
+    enable_memory_snapshot=True,
+    min_containers=0,
+    scaledown_window=60,
+    max_containers=20,
+    buffer_containers=1,
     startup_timeout=600,
+    # R1 (2026-08-31): regions failover for A100-80GB pool.
+    # Root cause of submit-level ECONNRESET storm: us-east A100 pool was
+    # over-committed (0 active containers despite app 'deployed'). Adding
+    # us-west as alternative lets Modal scheduler pick whichever region has
+    # available A100. Modal ASGI gateway is region-agnostic — endpoint URL
+    # stays the same; cold-start now hits whichever region responds first.
+    # See MEMORY [[modal-regions-failover-2026-08-31]].
+    regions=["us-east", "us-west"],
 )
 @modal.asgi_app()
 def serve():
@@ -334,12 +371,37 @@ def serve():
     return web_app
 
 
+# =============================================================================
+# Pre-warm: REMOVED 2026-08-31 (replaced by Modal-native autoscaler above).
+# See B3 → B0 migration notes in MEMORY.
+# =============================================================================
+# Earlier design (B3): a scheduled function that pinged /system_stats every 4 min
+# to keep the GPU container warm. This FAILED in production:
+#   - Default Modal image lacks httpx (ModuleNotFoundError, container scaled down)
+#   - Ping timeout (30-120s) < cold start (110s+) → scheduled ping races cold start
+#   - Cron-style polling is fragile for keeping GPU state alive
+#
+# New design (B0): Modal-native autoscaler on serve() decorator:
+#   - min_containers=0      → no idle cost, pay only for real requests
+#   - scaledown_window=60   → die fast when idle (was 300s)
+#   - max_containers=20     → ceiling under burst
+#   - buffer_containers=1   → 1 extra ready, no cold-start on burst
+# (Modal SDK has no `scaleup_window`; autoscaler reacts to demand growth
+# via its own internal heuristic — typically <1s.)
+#
+# Residual cold-start cost: first request after scaledown pays ~60s
+# (model copy + ComfyUI ready). Mitigation: B1 worker IN_QUEUE_TIMEOUT_MS
+# 10 → 25 min (worker safety net).
+# =============================================================================
+
+
 @app.local_entrypoint()
 def main():
     log.info("=== Modal ComfyUI H3 app ===")
     log.info("Setup models:  modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx")
     log.info("Setup Civitai LoRA: modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli --model-id N --version-id N --file-id N --target-path models/loras/X.safetensors --sha256 ... --civitai-api-key KEY")
     log.info("Deploy:        modal deploy modal_comfyui_minimax_h3.py")
+    log.info("Autoscaler:    min=0 max=20 buffer=1 scaledown=60s")
 
 
 # =============================================================================
