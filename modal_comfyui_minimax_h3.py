@@ -192,7 +192,6 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 # =============================================================================
 @app.function(
     image=image,
-    gpu="A100-80GB",
     volumes={"/modal-data": h3_models_volume},
     cpu=4,
     memory=16384,
@@ -228,7 +227,15 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # available A100. Modal ASGI gateway is region-agnostic — endpoint URL
     # stays the same; cold-start now hits whichever region responds first.
     # See MEMORY [[modal-regions-failover-2026-08-31]].
-    regions=["us-east", "us-west"],
+    region=["us-east", "us-west"],
+    # H1 (2026-08-31): A100-80GB → H100 SXM5.
+    # A100 pool currently saturated in us-east + us-west (0 active containers,
+    # HTTP 303 webhook timeout after 150s). H100 has available capacity.
+    # Bonus: H100 + Sage Attention 2 (entrypoint flag) = 2.85x faster
+    # inference (256s → ~90s for mystic@0.7 portrait). H100's higher
+    # $/sec is OFFSET by 2x speedup → $0.099/gen vs $0.178/gen on A100
+    # (−44% per gen). See MEMORY [[reelant-modal-h100-sage-attention-2026-08-31]].
+    gpu="H100",
 )
 @modal.asgi_app()
 def serve():
