@@ -69,10 +69,17 @@ image = (
         # - ComfyUI-KJNodes: PatchSageAttentionKJ (recommended for H3 speedup, per
         #   https://docs.comfy.org/tutorials/video/minimax/minimax-h3) + ImageResizeKJv2
         # - ComfyUI-LTXVideo: MiniMaxH3SigmaShift (H3 sigma-shift helper node)
+        # - Comfyui_Minimax_h3_latent_Upscaler (LBH-123-AI): MinimaxH3LatentUpscaler3D
+        #   class for 24-channel H3 latent 3D upscaling. Used by
+        #   minimax-h3-preview-upscaled style — first-pass 448x768 then 2x upscale
+        #   to 896x1536 (~50-60% baseline cost, visually competitive). Weights are
+        #   downloaded separately by setup_minimax_h3_models() into
+        #   /ComfyUI/models/latent_upscale_models/. See MEMORY [[modal-h3-upscaler-2026-09-01]].
         "rm -rf /ComfyUI/custom_nodes/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
         "git clone --depth=1 https://github.com/yolain/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-Easy-Use",
         "git clone --depth=1 https://github.com/kijai/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-KJNodes",
         "git clone --depth=1 https://github.com/Lightricks/ComfyUI-LTXVideo /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
+        "git clone --depth=1 https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler /ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler",
     )
     .run_commands(
         # Install custom node deps
@@ -83,8 +90,29 @@ image = (
         # ASGI proxy deps (serve() uses FastAPI + httpx)
         "pip install --no-cache-dir fastapi httpx 'starlette>=0.36'",
         # Sage attention — soft requirement for MiniMax H3 (recommended in docs.comfy.org).
-        # Falls back gracefully if not installed; we install it for the perf boost.
-        "pip install --no-cache-dir --break-system-packages sageattention || true",
+        # MUST install from git — SageAttention 2.2.0 is NOT on PyPI (latest = 1.0.6, Nov 2024).
+        # PyPI install of "sageattention==2.2.0" silently fails with "No matching distribution",
+        # which previously got masked by `|| true` and a Modal layer cache hit → deploy
+        # "succeeded" but SA2 kernels never landed in the image. Now we install from git
+        # main branch (pinned to commit d1a57a5 = 2.2.0 with sm90 FP8 kernels).
+        #
+        # CRITICAL: TORCH_CUDA_ARCH_LIST must be set BEFORE pip install. Modal build
+        # workers have NO GPU → torch.utils.cpp_extension can't auto-detect compute
+        # capability → build dies with "No target compute capabilities". H100 = Hopper
+        # = sm_90; we add "9.0+PTX" for forward-compat.
+        #
+        # --no-build-isolation makes pip use the image's already-installed torch 2.8.0 /
+        # triton 3.0+ / CUDA 12.4 (so the compiled kernels bind to ABI-compatible torch).
+        # Without --no-build-isolation pip builds in an isolated env with OLD torch →
+        # missing _qattn_sm90 / _qattn_sm120 kernels → "sageattention is not new enough"
+        # or "could not determine CUDA architecture" errors at runtime.
+        #
+        # We keep fallback (warn-only) because SA2 is an optimization, not a hard
+        # requirement — but we now log install output instead of `|| true`-silencing it.
+        "TORCH_CUDA_ARCH_LIST='9.0+PTX' pip install --no-cache-dir --break-system-packages "
+        "--no-build-isolation "
+        "git+https://github.com/thu-ml/SageAttention.git 2>&1 | tail -10 "
+        "|| echo 'WARN: sageattention install failed — falling back to comfy kitchen attention'",
         # Pin transformers/torchaudio/huggingface_hub to CUDA 12-compatible versions
         # (sombi base ships v5.x which conflicts with comfy.ldm.minimax imports).
         "pip install --no-cache-dir --break-system-packages transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
@@ -159,6 +187,17 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
             "loras/MysticXXX_MMH3-V4.safetensors",
             "https://huggingface.co/lynaNSFW/mysticxxx_MM_H3/resolve/main/MysticXXX_MMH3-V4.safetensors",
             100_000_000,
+        ),
+        # H3 3D latent upscaler (bf16) — required by minimax-h3-preview-upscaled style.
+        # BCTHW-aware: handles H3's 24-channel latent including temporal dim. Default
+        # 2x scale (40% of training data). Disk: ~691 MB.
+        # Placed in ComfyUI/models/latent_upscale_models/ where the LBH custom node's
+        # COMBO model_name field auto-discovers. See workflow node 500 in
+        # minimax-h3-preview-upscaled.cleaned.json + MEMORY [[modal-h3-upscaler-2026-09-01]].
+        (
+            "latent_upscale_models/minimax_h3_latent_upscaler_3d_bf16.safetensors",
+            "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_bf16.safetensors",
+            600_000_000,  # 691 MB - 10% tolerance
         ),
     ]
 
@@ -299,8 +338,8 @@ def serve():
             shutil.copy2(src, dst)
             log.info(f"Copied ({os.path.getsize(dst)/1e9:.2f} GB)")
 
-    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/
-    for sub in ("diffusion_models", "text_encoders", "vae", "loras"):
+    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/, latent_upscale_models/
+    for sub in ("diffusion_models", "text_encoders", "vae", "loras", "latent_upscale_models"):
         os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
         copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
 
@@ -314,7 +353,15 @@ def serve():
     os.symlink("/modal-data/output", "/ComfyUI/output")
     log.info("Linked /ComfyUI/output → /modal-data/output")
 
-    # Launch ComfyUI on :8188
+    # Launch ComfyUI on :8188.
+    # 2026-08-31 (revert from --use-sage-attention + --fp8_e4m3fn-unet):
+    #   Both flags broke MiniMax-H3 because the rms_rope_split_half_ kernel
+    #   in comfy.quant_ops.ck rejects fp8 q_scale tensors (NoCapableBackendError
+    #   in node 151 SamplerCustomAdvanced). The rope op only accepts bf16/fp32/fp16
+    #   for q_scale. Last WORKING config: native int8 weights + comfy kitchen attention,
+    #   no CLI flags. Cost: ~256s for mystic@0.7 portrait (vs ~90s with SA2+fp8).
+    #   Pending: ask upstream for sage kernel that handles fp8 q_scale, or cast
+    #   q_scale→bf16 in post-load hook. See MEMORY + .workflow-scratch/ for context.
     log_file = open("/tmp/comfy.log", "w")
     proc = subprocess.Popen(
         [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1", "--port", "8188",
