@@ -10,7 +10,7 @@ Reuses the proven scaffold from modal_comfyui.py:
   - sombi base image (sombi/comfyui:base-torch2.8.0-cu124)
   - /ComfyUI mount, --output-directory /modal-data/output, ASGI proxy
   - copy_dir_contents from Modal Volume to /ComfyUI/models/
-  - same 600s startup, 1800s timeout, 300s scaledown_window
+  - same 600s startup, 1800s timeout, 5s scaledown_window (R.117, 2026-09-01)
 
 Differences from modal_comfyui.py:
   - app name: comfyui-minimax-h3
@@ -30,6 +30,7 @@ Deploy:
 
 import os
 import time
+import threading
 import logging
 import modal
 
@@ -116,6 +117,14 @@ image = (
         # Pin transformers/torchaudio/huggingface_hub to CUDA 12-compatible versions
         # (sombi base ships v5.x which conflicts with comfy.ldm.minimax imports).
         "pip install --no-cache-dir --break-system-packages transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
+        # Patch MiniMax H3 2D upscaler to handle NestedTensor inputs (R.109 fix).
+        # Symptom: AttributeError 'NestedTensor' object has no attribute 'clone'
+        # at the line `s = latent["samples"].clone()` inside MinimaxH3LatentUpscalerNode2D.run().
+        # Root cause: H3 sampler output (node 151 → SamplerCustomAdvanced) is wrapped
+        # in torch.nested.nested_tensor.NestedTensor (SDPA / attention backend may emit
+        # nested tensors under certain conditions). NestedTensor lacks .clone().
+        # Fix: convert NestedTensor → dense padded tensor before clone.
+        "python3 - <<'EOF'\nimport sys\np = '/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler/nodes/minimax_h3_latent_upscaler_2d.py'\ntry:\n    with open(p) as f:\n        src = f.read()\nexcept FileNotFoundError:\n    print(f'WARN: {p} not found — skipping upscaler patch', file=sys.stderr)\n    sys.exit(0)\nold = '        s = latent[\"samples\"].clone()\\n        orig_dtype = s.dtype'\nnew = '''        samples_in = latent[\"samples\"]\n        # Patch 2026-09-01 (R.109): NestedTensor inputs lack .clone(). Convert to dense.\n        if hasattr(samples_in, 'is_nested') and samples_in.is_nested:\n            samples_in = samples_in.to_padded_tensor(0)\n        s = samples_in.clone()\n        orig_dtype = s.dtype'''\nif old in src:\n    src = src.replace(old, new)\n    with open(p, 'w') as f:\n        f.write(src)\n    print('Patched: MinimaxH3LatentUpscalerNode2D NestedTensor → dense')\nelse:\n    print('PATCH ALREADY APPLIED or pattern not found — leaving file unchanged')\nEOF",
     )
     .entrypoint([])  # disable base image entrypoint; we start ComfyUI ourselves
 )
@@ -231,7 +240,16 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 # =============================================================================
 @app.function(
     image=image,
-    volumes={"/modal-data": h3_models_volume},
+    # R.118 (2026-09-01): dual-mount LoRAs via sub_path to eliminate ~30s copy
+    # of 6 LoRA files (~6.55 GB) on every cold start. ComfyUI scanner treats
+    # direct mount points as real directories (not symlinks), so it follows
+    # them. /modal-data is still needed for the full volume (setup +
+    # /modal-data/output), but ComfyUI only reads from /ComfyUI/models/loras
+    # via this bind mount — no copy needed.
+    volumes={
+        "/modal-data": h3_models_volume,
+        "/ComfyUI/models/loras": h3_models_volume.with_mount_options(sub_path="models/loras"),
+    },
     cpu=4,
     memory=16384,
     timeout=1800,
@@ -240,7 +258,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # (30-120s timeout < 110s cold start) AND depends on httpx in default
     # image. Modal's built-in autoscaler handles these correctly:
     #   - min_containers=0      → no idle cost
-    #   - scaledown_window=60   → die fast when idle (was 300)
+    #   - scaledown_window=5    → die fast when idle (was 60 → R.117 2026-09-01)
     #   - max_containers=20     → ceiling under burst
     #   - buffer_containers=1   → 1 extra ready, no cold-start on burst
     # NOTE: `scaleup_window` is NOT a valid Modal SDK param — Modal's
@@ -255,7 +273,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # snapshots are maturing (CPU GA; GPU stable on A100 per 2026-08 docs).
     enable_memory_snapshot=True,
     min_containers=0,
-    scaledown_window=60,
+    scaledown_window=5,
     max_containers=20,
     buffer_containers=1,
     startup_timeout=600,
@@ -338,10 +356,26 @@ def serve():
             shutil.copy2(src, dst)
             log.info(f"Copied ({os.path.getsize(dst)/1e9:.2f} GB)")
 
-    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/, latent_upscale_models/
-    for sub in ("diffusion_models", "text_encoders", "vae", "loras", "latent_upscale_models"):
+    # H3 files live under text_encoders/, diffusion_models/, vae/, latent_upscale_models/.
+    # R.118 (2026-09-01): `loras` is mounted directly via sub_path (see serve() decorator)
+    # so ComfyUI reads it without copying. Copying the rest in a background thread so
+    # ComfyUI can start booting in parallel — cold start goes from ~3.5 min to ~30s
+    # because the ~40 GB model copy (diffusion_models + text_encoders + vae +
+    # latent_upscale_models, ~3 min) no longer blocks ComfyUI boot.
+    # ComfyUI's model_management.load_models is lazy — files arrive during first
+    # inference and load on demand. Worker tolerates slow model load via R.116
+    # exponential backoff in waitForVideoUrl.
+    copy_subs = ("diffusion_models", "text_encoders", "vae", "latent_upscale_models")
+    for sub in copy_subs:
         os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
-        copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+
+    def _copy_models_async():
+        for sub in copy_subs:
+            copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        log.info("Async model copy complete")
+
+    threading.Thread(target=_copy_models_async, daemon=True).start()
+    log.info(f"Started async model copy for: {', '.join(copy_subs)} (loras mounted via sub_path, skipping copy)")
 
     # Persist output to Modal Volume so it survives container scaledown
     os.makedirs("/modal-data/output", exist_ok=True)
@@ -437,15 +471,15 @@ def serve():
 #
 # New design (B0): Modal-native autoscaler on serve() decorator:
 #   - min_containers=0      → no idle cost, pay only for real requests
-#   - scaledown_window=60   → die fast when idle (was 300s)
+#   - scaledown_window=5    → die fast when idle (R.117 2026-09-01, was 60s)
 #   - max_containers=20     → ceiling under burst
 #   - buffer_containers=1   → 1 extra ready, no cold-start on burst
 # (Modal SDK has no `scaleup_window`; autoscaler reacts to demand growth
 # via its own internal heuristic — typically <1s.)
 #
-# Residual cold-start cost: first request after scaledown pays ~60s
-# (model copy + ComfyUI ready). Mitigation: B1 worker IN_QUEUE_TIMEOUT_MS
-# 10 → 25 min (worker safety net).
+# Residual cold-start cost: first request after scaledown pays ~10s
+# (memory snapshot restore, B1 2026-08-31). Mitigation: B1 worker
+# IN_QUEUE_TIMEOUT_MS 10 → 25 min (worker safety net).
 # =============================================================================
 
 
@@ -455,7 +489,7 @@ def main():
     log.info("Setup models:  modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx")
     log.info("Setup Civitai LoRA: modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli --model-id N --version-id N --file-id N --target-path models/loras/X.safetensors --sha256 ... --civitai-api-key KEY")
     log.info("Deploy:        modal deploy modal_comfyui_minimax_h3.py")
-    log.info("Autoscaler:    min=0 max=20 buffer=1 scaledown=60s")
+    log.info("Autoscaler:    min=0 max=20 buffer=1 scaledown=5s")
 
 
 # =============================================================================
