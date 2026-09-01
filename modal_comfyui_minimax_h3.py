@@ -355,26 +355,38 @@ def serve():
             log.info(f"Copied ({os.path.getsize(dst)/1e9:.2f} GB)")
 
     # H3 files live under text_encoders/, diffusion_models/, vae/, loras/, latent_upscale_models/.
-    # R.118 (2026-09-01): copy all in a background thread so ComfyUI can boot
-    # in parallel — cold start goes from ~3.5 min to ~30s because the ~46 GB
-    # model copy no longer blocks ComfyUI boot. ComfyUI's model_management.load_models
-    # is lazy — files arrive during first inference and load on demand. Worker
-    # tolerates slow model load via R.116 exponential backoff in waitForVideoUrl.
+    # R.118 hybrid (2026-09-01, attempt 3): LoRAs are SYNCHRONOUS — workflow
+    # references them by name and gen fails if not on disk when /api/prompt fires
+    # (failed in v18: "Modal completed but no video found in outputs"). Big
+    # models (diffusion_models + text_encoders + vae + latent_upscale_models,
+    # ~40 GB / ~3 min) are still copied in a background thread — ComfyUI's
+    # model_management.load_models is lazy so they arrive during first inference.
     #
-    # Original R.118 plan also dual-mounted LoRAs via sub_path (skipping the
-    # ~30s / ~6.55 GB LoRA copy entirely), but Modal blocks mounting the same
-    # Volume twice in one function — so LoRAs get copied too, in background.
-    copy_subs = ("diffusion_models", "text_encoders", "vae", "loras", "latent_upscale_models")
-    for sub in copy_subs:
+    # v18 (all-async) failed: cold start logged "ComfyUI ready after 23s" but
+    # /api/prompt at +0.1s raced LoRA copy. Worker reported "no video in
+    # outputs" — inference started before HMCumshot/Mystic/Turbo LoRAs existed.
+    #
+    # Sync LoRA copy adds ~25s to first request, keeps async savings (~3 min)
+    # for big models. Net cold start: ~3.5 min → ~50s vs target ~30s.
+    sync_subs = ("loras",)
+    async_subs = ("diffusion_models", "text_encoders", "vae", "latent_upscale_models")
+    for sub in sync_subs + async_subs:
         os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
 
+    # Sync copy: LoRAs (~6.55 GB / 5 files / ~25s). Blocks ComfyUI boot.
+    log.info(f"Sync copy (blocks ComfyUI boot): {', '.join(sync_subs)}")
+    for sub in sync_subs:
+        copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+    log.info("Sync copy complete (LoRAs on disk)")
+
+    # Async copy: big models (~40 GB / ~3 min). ComfyUI boots in parallel.
     def _copy_models_async():
-        for sub in copy_subs:
+        for sub in async_subs:
             copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
         log.info("Async model copy complete")
 
     threading.Thread(target=_copy_models_async, daemon=True).start()
-    log.info(f"Started async model copy for: {', '.join(copy_subs)} (ComfyUI will boot in parallel)")
+    log.info(f"Started async model copy for: {', '.join(async_subs)} (ComfyUI will boot in parallel)")
 
     # Persist output to Modal Volume so it survives container scaledown
     os.makedirs("/modal-data/output", exist_ok=True)
