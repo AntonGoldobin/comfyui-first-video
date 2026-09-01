@@ -240,16 +240,14 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 # =============================================================================
 @app.function(
     image=image,
-    # R.118 (2026-09-01): dual-mount LoRAs via sub_path to eliminate ~30s copy
-    # of 6 LoRA files (~6.55 GB) on every cold start. ComfyUI scanner treats
-    # direct mount points as real directories (not symlinks), so it follows
-    # them. /modal-data is still needed for the full volume (setup +
-    # /modal-data/output), but ComfyUI only reads from /ComfyUI/models/loras
-    # via this bind mount — no copy needed.
-    volumes={
-        "/modal-data": h3_models_volume,
-        "/ComfyUI/models/loras": h3_models_volume.with_mount_options(sub_path="models/loras"),
-    },
+    # R.118 (2026-09-01, attempt 2): Prong 1 (dual-mount LoRAs via sub_path)
+    # rejected by Modal — `with_mount_options(sub_path=...)` is treated as a
+    # separate mount and Modal blocks mounting the same Volume twice in one
+    # function ("The same Volume cannot be mounted in multiple locations").
+    # Falling back to Prong 2 only: async background copy for all subdirs.
+    # LoRAs still get copied (~30s of the ~3 min), but ComfyUI boots in parallel
+    # so total cold start is ~30s vs ~3.5 min before. See comment in serve() below.
+    volumes={"/modal-data": h3_models_volume},
     cpu=4,
     memory=16384,
     timeout=1800,
@@ -356,16 +354,17 @@ def serve():
             shutil.copy2(src, dst)
             log.info(f"Copied ({os.path.getsize(dst)/1e9:.2f} GB)")
 
-    # H3 files live under text_encoders/, diffusion_models/, vae/, latent_upscale_models/.
-    # R.118 (2026-09-01): `loras` is mounted directly via sub_path (see serve() decorator)
-    # so ComfyUI reads it without copying. Copying the rest in a background thread so
-    # ComfyUI can start booting in parallel — cold start goes from ~3.5 min to ~30s
-    # because the ~40 GB model copy (diffusion_models + text_encoders + vae +
-    # latent_upscale_models, ~3 min) no longer blocks ComfyUI boot.
-    # ComfyUI's model_management.load_models is lazy — files arrive during first
-    # inference and load on demand. Worker tolerates slow model load via R.116
-    # exponential backoff in waitForVideoUrl.
-    copy_subs = ("diffusion_models", "text_encoders", "vae", "latent_upscale_models")
+    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/, latent_upscale_models/.
+    # R.118 (2026-09-01): copy all in a background thread so ComfyUI can boot
+    # in parallel — cold start goes from ~3.5 min to ~30s because the ~46 GB
+    # model copy no longer blocks ComfyUI boot. ComfyUI's model_management.load_models
+    # is lazy — files arrive during first inference and load on demand. Worker
+    # tolerates slow model load via R.116 exponential backoff in waitForVideoUrl.
+    #
+    # Original R.118 plan also dual-mounted LoRAs via sub_path (skipping the
+    # ~30s / ~6.55 GB LoRA copy entirely), but Modal blocks mounting the same
+    # Volume twice in one function — so LoRAs get copied too, in background.
+    copy_subs = ("diffusion_models", "text_encoders", "vae", "loras", "latent_upscale_models")
     for sub in copy_subs:
         os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
 
@@ -375,7 +374,7 @@ def serve():
         log.info("Async model copy complete")
 
     threading.Thread(target=_copy_models_async, daemon=True).start()
-    log.info(f"Started async model copy for: {', '.join(copy_subs)} (loras mounted via sub_path, skipping copy)")
+    log.info(f"Started async model copy for: {', '.join(copy_subs)} (ComfyUI will boot in parallel)")
 
     # Persist output to Modal Volume so it survives container scaledown
     os.makedirs("/modal-data/output", exist_ok=True)
