@@ -299,8 +299,6 @@ echo "ComfyUI log: $LOG_FILE (also at /tmp/comfyui.log)"
     --base-directory "$COMFYUI_DIR" \
     --output-directory "$COMFYUI_DIR/output" \
     --temp-directory "$COMFYUI_DIR/temp" \
-    --use-sage-attention \
-    --fp8_e4m3fn-unet \
     > /tmp/comfyui.log 2>&1 &
 
 COMFY_PID=$!

@@ -271,7 +271,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # snapshots are maturing (CPU GA; GPU stable on A100 per 2026-08 docs).
     enable_memory_snapshot=True,
     min_containers=0,
-    scaledown_window=5,
+    scaledown_window=60,
     max_containers=20,
     buffer_containers=1,
     startup_timeout=600,
