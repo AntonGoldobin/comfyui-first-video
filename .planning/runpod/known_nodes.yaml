@@ -1,0 +1,43 @@
+# Custom-node map for comfyui-first-video. Every `class_type` referenced
+# in the workflow must appear as a key here, or the static validator
+# emits a `high` finding (`RN002`). The value is the source repo so
+# operators can paste a missing class_type into a new entry.
+#
+# Sources verified against the actual api-workflow-minimal.json
+# (the canonical minimal workflow for this project).
+
+DualCLIPLoader:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+  notes: "Bundled with ComfyUI core"
+VAELoader:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+CLIPTextEncode:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+LTXVConditioning:
+  repo: "https://github.com/Lightricks/ComfyUI-LTXVideo"
+UNETLoader:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+RandomNoise:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+KSamplerSelect:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+ManualSigmas:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+CFGGuider:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+EmptyLTXVLatentVideo:
+  repo: "https://github.com/Lightricks/ComfyUI-LTXVideo"
+LTXVEmptyLatentAudio:
+  repo: "https://github.com/Lightricks/ComfyUI-LTXVideo"
+LTXVConcatAVLatent:
+  repo: "https://github.com/Lightricks/ComfyUI-LTXVideo"
+SamplerCustomAdvanced:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+LTXVSeparateAVLatent:
+  repo: "https://github.com/Lightricks/ComfyUI-LTXVideo"
+VAEDecodeTiled:
+  repo: "https://github.com/comfyanonymous/ComfyUI"
+VHS_VideoCombine:
+  repo: "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
+LTXVAudioVAEDecode:
+  repo: "https://github.com/Lightricks/ComfyUI-LTXVideo"

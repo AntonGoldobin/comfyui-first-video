@@ -1,0 +1,23 @@
+# Models referenced by the workflow. Every filename that appears in a
+# workflow `inputs` string ending in `.safetensors|.pt|.bin|.gguf|.ckpt`
+# must have its basename listed here, or the static validator emits a
+# `critical` finding (`RN001`) and blocks the deploy.
+#
+# Names match the actual files in `download-models.sh` + the network
+# volume at `/runpod-volume/models/{diffusion_models,text_encoders,vae,loras,
+# latent_upscale_models}/`.
+
+models:
+  # Diffusion / base model
+  - ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors
+  # Text encoders
+  - gemma3-12B-hereticx-sikaworld.safetensors
+  - ltx-2.3_text_projection_bf16.safetensors
+  # VAE
+  - LTX23_video_vae_bf16.safetensors
+  - LTX23_audio_vae_bf16.safetensors
+  # LoRAs
+  - ltx2310eros_v1.safetensors
+  - taeltx2_3.safetensors
+  # Latent upscalers
+  - ltx-2.3-spatial-upscaler-x2-1.1.safetensors
