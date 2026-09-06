@@ -44,6 +44,40 @@ h3_models_volume = modal.Volume.from_name(
     "comfyui-minimax-h3-models", create_if_missing=True
 )
 
+# =============================================================================
+# R.119 (2026-09-05): idempotency state for H3Generator.generate().
+# Atomic nonce-keyed claim — see handoff doc + memory card
+# r119-cold-start-idempotency-required-2026-09-05. Without this, cold-start
+# retries create duplicate GPU jobs because the Modal Web Function gateway
+# 307-redirects at 150s AFTER the function has already entered on the GPU
+# container (verified empirically 2026-09-05).
+# =============================================================================
+jobs = modal.Dict.from_name("h3-job-state", create_if_missing=True)
+
+# R.119: STALE_THRESHOLD env-override path.
+# PERMANENT DEBUG KNOB — default = function timeout (900) + transport buffer
+# (60). Mechanism is fully inert unless STALE_THRESHOLD_OVERRIDE is explicitly
+# set at deploy time. Captured into a Modal Secret (Modal does NOT auto-
+# propagate non-MODAL_* env vars to containers — see r119-handoff.md and
+# r119-mf-shipped-verified-2026-09-05.md for the gotcha).
+#
+# Usage for staleness-recovery testing:
+#   STALE_THRESHOLD_OVERRIDE=20 modal deploy modal_comfyui_minimax_h3.py
+#
+# This bakes a 20s threshold into the deployed function bytecode, letting the
+# staleness-recovery branch be exercised in ~25s instead of waiting 16 min.
+# After testing, deploy without the env var to restore default=960. Verified
+# 2026-09-05: prod deploy (no env var) behaves with default 960.
+_R119_SECRETS = []
+if os.environ.get("STALE_THRESHOLD_OVERRIDE"):
+    _R119_SECRETS.append(
+        modal.Secret.from_dict(
+            {"STALE_THRESHOLD_OVERRIDE": os.environ["STALE_THRESHOLD_OVERRIDE"]}
+        )
+    )
+
+STALE_THRESHOLD = int(os.environ.get("STALE_THRESHOLD_OVERRIDE", "960"))
+
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
     .run_commands(
@@ -428,6 +462,66 @@ def serve():
             pass
         raise RuntimeError("ComfyUI startup timeout")
 
+    # R.137 (2026-09-03): background watcher that commits the Modal Volume after
+    # ComfyUI SaveVideo writes a video file. Without explicit commit, /view lookups
+    # from other containers (including cold-starts after scaledown) hit a 200/404
+    # race window of 17-30s+ because the Modal Volume sync is asynchronous.
+    # Strategy: poll /modal-data/output every 500ms; when a new .mp4 appears,
+    # wait until its size is stable for 2s (write complete), then commit.
+    # Idempotent — volume.commit() is a no-op if nothing changed since last commit.
+    import threading
+    OUTPUT_DIR = "/modal-data/output"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    known_files: dict[str, int] = {}  # filename -> size at last commit
+
+    def volume_commit_watcher():
+        log.info("=== R.137 volume_commit_watcher started ===")
+        while True:
+            try:
+                current_files: dict[str, int] = {}
+                for fname in os.listdir(OUTPUT_DIR):
+                    if not (fname.endswith(".mp4") or fname.endswith(".webm") or fname.endswith(".mov")):
+                        continue
+                    fpath = os.path.join(OUTPUT_DIR, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
+                        current_files[fname] = os.path.getsize(fpath)
+                    except OSError:
+                        continue
+                # Find new files (or files whose size grew since last commit)
+                to_commit: list[str] = []
+                for fname, size in current_files.items():
+                    if fname not in known_files or known_files[fname] != size:
+                        to_commit.append(fname)
+                if to_commit:
+                    # Wait 2s and re-check size to ensure file write is complete
+                    time.sleep(2)
+                    stable_files: list[str] = []
+                    for fname in to_commit:
+                        fpath = os.path.join(OUTPUT_DIR, fname)
+                        try:
+                            new_size = os.path.getsize(fpath)
+                            if new_size == current_files[fname]:
+                                stable_files.append(fname)
+                        except OSError:
+                            continue
+                    if stable_files:
+                        try:
+                            h3_models_volume.commit()
+                            for fname in stable_files:
+                                known_files[fname] = current_files[fname]
+                            log.info(f"R.137 committed {len(stable_files)} new/stable file(s): {stable_files[:3]}")
+                        except Exception as ce:
+                            log.warning(f"R.137 volume.commit() failed: {ce}")
+            except Exception as e:
+                log.warning(f"R.137 watcher loop error: {e}")
+            time.sleep(0.5)
+
+    watcher_thread = threading.Thread(target=volume_commit_watcher, daemon=True, name="volume-commit-watcher")
+    watcher_thread.start()
+    log.info("R.137 volume_commit_watcher thread spawned")
+
     web_app = FastAPI(title="ComfyUI MiniMax-H3 on Modal")
 
     async def proxy(request: Request, path: str) -> Response:
@@ -449,11 +543,473 @@ def serve():
             log.exception("ComfyUI proxy error")
             raise HTTPException(status_code=502, detail=f"ComfyUI proxy error: {e}")
 
+    # =============================================================================
+    # R.119 (2026-09-05): NEW /api/run + /api/status/{nonce} endpoints.
+    # Worker calls POST /api/run instead of POST /api/prompt + poll /api/history +
+    # GET /api/view. The proxy below remains intact for backward compat — old
+    # clients keep working. /api/run invokes H3Generator().generate.remote(...)
+    # via asyncio.to_thread, which blocks until the GPU container returns
+    # video bytes (or raises an idempotency error).
+    #
+    # MUST be registered BEFORE the catch-all api_route("/{path:path}") below —
+    # FastAPI/Starlette first-match routing, so the catch-all shadows literal
+    # paths declared after it.
+    # =============================================================================
+    import asyncio
+    import json as _json
+
+    @web_app.post("/api/run")
+    async def api_run(request: Request):
+        body = await request.body()
+        try:
+            payload = _json.loads(body) if body else {}
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid JSON body")
+
+        workflow_json = payload.get("workflow")
+        image_b64 = payload.get("image", "") or ""
+        nonce = payload.get("nonce")
+        if not nonce:
+            raise HTTPException(status_code=400, detail="missing nonce")
+        if not workflow_json:
+            raise HTTPException(status_code=400, detail="missing workflow")
+
+        log.info(f"/api/run nonce={nonce} workflow_keys={list(workflow_json.keys())[:3] if isinstance(workflow_json, dict) else type(workflow_json).__name__}")
+
+        # Mirror Step 0.5 verified pattern: .remote() blocks inside asyncio.to_thread
+        # so the FastAPI event loop stays responsive. Worker @nestjs/axios timeout
+        # is 900s — same envelope as Modal function timeout.
+        def call_remote():
+            return H3Generator().generate.remote(workflow_json, image_b64, nonce)
+
+        t0 = time.time()
+        try:
+            result_bytes = await asyncio.to_thread(call_remote)
+        except Exception as e:
+            elapsed = time.time() - t0
+            log.exception(f"/api/run nonce={nonce} failed after {elapsed:.1f}s")
+            # Surface the exception message — worker uses it for idempotency
+            # decision-making (DUPLICATE / PREVIOUS_ATTEMPT_FAILED / etc.).
+            raise HTTPException(status_code=500, detail=str(e)[:1000])
+        elapsed = time.time() - t0
+        log.info(f"/api/run nonce={nonce} returned {len(result_bytes)} bytes after {elapsed:.1f}s")
+        return Response(
+            content=result_bytes,
+            media_type="video/mp4",
+            headers={"X-Nonce": nonce, "X-Elapsed": f"{elapsed:.1f}"},
+        )
+
+    @web_app.get("/api/status/{nonce}")
+    async def api_status(nonce: str):
+        # CPU-only status check — used by worker on retry to avoid burning
+        # GPU on DUPLICATE checks. Returns the jobs[nonce] state dict, or
+        # {"status": "not_found"} if the nonce was never seen.
+        def call_remote():
+            return check_job_status.remote(nonce)
+        try:
+            status = await asyncio.to_thread(call_remote)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:500])
+        return status
+
     @web_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
     async def handle(request: Request, path: str):
         return await proxy(request, path)
 
     return web_app
+
+
+# =============================================================================
+# R.119 (2026-09-05): H3Generator — direct method-based invocation, no HTTP
+# roundtrip. Returns video bytes directly so worker never touches /api/view
+# (which serves from ComfyUI's in-memory OUTPUTS_MAP and 404s after scaledown).
+#
+# Idempotency model (v3):
+#   1. Atomic claim via jobs.put(nonce, {status:running}, skip_if_exists=True).
+#      Returns True if we got the slot; False if nonce already existed.
+#   2. If we lost the race, inspect existing status:
+#        - done    → return cached result (idempotent retry)
+#        - failed  → raise PREVIOUS_ATTEMPT_FAILED (worker surfaces to user)
+#        - running → check staleness; if age < STALE_THRESHOLD raise DUPLICATE
+#                    so worker backs off; if age >= STALE_THRESHOLD, reclaim
+#                    (original container must have died hard — OOM, kill, etc.)
+#   3. Run workflow via local ComfyUI on :8188 (same container, no HTTP proxy).
+#   4. Explicit volume.commit() before returning bytes — replaces R.137 watcher.
+#
+# Why STALE_THRESHOLD = 960: function timeout is 900s + 60s transport buffer.
+# Any "running" entry older than that means the original job is dead.
+# =============================================================================
+@app.cls(
+    image=image,
+    volumes={"/modal-data": h3_models_volume},
+    secrets=_R119_SECRETS,
+    cpu=4,
+    memory=16384,
+    timeout=1800,                  # class-level container lifetime cap
+    enable_memory_snapshot=True,   # snapshot after @modal.enter() completes
+    min_containers=0,
+    scaledown_window=5,
+    max_containers=20,
+    buffer_containers=1,
+    startup_timeout=600,
+    region=["us-east", "us-west"],
+    gpu="H100",
+)
+class H3Generator:
+    @modal.enter()
+    def setup(self):
+        """Initialize GPU container once per cold start. Symlinks models,
+        launches ComfyUI subprocess on :8188, waits for ready. Snapshotted."""
+        import subprocess
+        import shutil
+
+        log.info("=== H3Generator.setup() — initializing GPU container ===")
+
+        # Symlink so any internal /runpod-volume paths in custom nodes work
+        if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
+            os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
+
+        # Find python interpreter
+        python_bin = None
+        for cand in [
+            "/venv/bin/python3", "/venv/bin/python",
+            "/opt/venv/bin/python", "/usr/bin/python3",
+            "/usr/local/bin/python3",
+        ]:
+            if os.path.exists(cand) and os.access(cand, os.X_OK):
+                python_bin = cand
+                break
+        if not python_bin:
+            python_bin = shutil.which("python3") or shutil.which("python")
+        if not python_bin:
+            raise RuntimeError("No python interpreter found in container")
+        log.info(f"Using python: {python_bin}")
+
+        # Sync model copy (R.131: async copy was unreliable)
+        def copy_dir_contents(src_dir, dst_dir):
+            if not os.path.isdir(src_dir):
+                return
+            os.makedirs(dst_dir, exist_ok=True)
+            for fname in os.listdir(dst_dir):
+                p = f"{dst_dir}/{fname}"
+                if os.path.islink(p):
+                    try:
+                        if os.path.realpath(p).startswith("/modal-data"):
+                            os.unlink(p)
+                    except Exception:
+                        pass
+            for fname in os.listdir(src_dir):
+                src = f"{src_dir}/{fname}"
+                dst = f"{dst_dir}/{fname}"
+                if os.path.isfile(dst) and not os.path.islink(dst):
+                    continue
+                if os.path.islink(dst):
+                    continue
+                if os.path.isdir(src):
+                    copy_dir_contents(src, dst)
+                    continue
+                log.info(f"Copying {src} → {dst}")
+                shutil.copy2(src, dst)
+
+        all_subs = (
+            "diffusion_models", "text_encoders", "vae",
+            "loras", "latent_upscale_models", "checkpoints",
+        )
+        for sub in all_subs:
+            os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
+            os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
+
+        log.info("Sync model copy (~50 GB / ~3 min)")
+        for sub in all_subs:
+            copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        log.info("Model copy complete")
+
+        # Persist output to Modal Volume
+        os.makedirs("/modal-data/output", exist_ok=True)
+        if os.path.islink("/ComfyUI/output") or os.path.isdir("/ComfyUI/output"):
+            if os.path.islink("/ComfyUI/output"):
+                os.unlink("/ComfyUI/output")
+            else:
+                shutil.rmtree("/ComfyUI/output")
+        os.symlink("/modal-data/output", "/ComfyUI/output")
+        log.info("Linked /ComfyUI/output → /modal-data/output")
+
+        # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
+        import httpx as _httpx
+        log_file = open("/tmp/comfy.log", "w")
+        self._proc = subprocess.Popen(
+            [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
+             "--port", "8188", "--disable-auto-launch", "--gpu-only",
+             "--output-directory", "/modal-data/output"],
+            stdout=log_file, stderr=subprocess.STDOUT,
+        )
+        log.info(f"ComfyUI PID: {self._proc.pid}")
+
+        # Wait for ComfyUI ready (max 10 min for cold start)
+        for i in range(600):
+            try:
+                r = _httpx.get("http://localhost:8188/system_stats", timeout=2)
+                if r.status_code == 200:
+                    log.info(f"ComfyUI ready after {i+1}s")
+                    break
+            except Exception:
+                pass
+            if i > 0 and i % 30 == 0:
+                try:
+                    with open("/tmp/comfy.log") as f:
+                        log.info(f"[comfy.log tail @ {i}s]\n{f.read()[-2000:]}")
+                except Exception:
+                    pass
+            time.sleep(1)
+        else:
+            try:
+                with open("/tmp/comfy.log") as f:
+                    log.error(f.read())
+            except Exception:
+                pass
+            raise RuntimeError("ComfyUI startup timeout (H3Generator)")
+
+        # Track initial output files for diff-after-execution
+        self._initial_outputs = set(os.listdir("/modal-data/output"))
+        log.info(f"H3Generator.setup() complete — initial_outputs={len(self._initial_outputs)}")
+
+    @modal.method()
+    def generate(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
+        """R.119 — entry point for /api/run. Returns video bytes.
+
+        Idempotency (v3): atomic claim via jobs.put(skip_if_exists=True).
+        Staleness recovery: if existing.status=='running' and age>=STALE_THRESHOLD,
+        reclaim the slot (original container died hard — OOM/kill/SIGKILL).
+        """
+        # 1. ATOMIC CLAIM — Modal Dict put with skip_if_exists returns
+        #    True if we wrote, False if the key already existed.
+        claim = jobs.put(
+            nonce,
+            {"status": "running", "started_at": time.time(),
+             "container": os.environ.get("MODAL_TASK_ID", "unknown")},
+            skip_if_exists=True,
+        )
+        if not claim:
+            existing = jobs.get(nonce)
+            if existing is None:
+                # Race: someone deleted between put and get. Retry claim.
+                claim = jobs.put(
+                    nonce,
+                    {"status": "running", "started_at": time.time()},
+                    skip_if_exists=True,
+                )
+                if not claim:
+                    existing = jobs.get(nonce) or {}
+                else:
+                    existing = {"status": "running", "started_at": time.time()}
+
+            if existing.get("status") == "done":
+                log.info(f"generate nonce={nonce}: idempotent hit, returning cached result ({len(existing.get('result', b''))} bytes)")
+                return existing["result"]
+            if existing.get("status") == "failed":
+                # Don't auto-retry — surface the previous error to the worker.
+                raise Exception(
+                    f"PREVIOUS_ATTEMPT_FAILED: {existing.get('error', 'unknown')}"
+                )
+            # status == "running" — check staleness
+            age = time.time() - existing.get("started_at", time.time())
+            if age < STALE_THRESHOLD:
+                raise Exception(
+                    f"DUPLICATE: nonce {nonce} still running (age={age:.0f}s)"
+                )
+            # Stale — original container died without writing status. Reclaim.
+            log.warning(
+                f"generate nonce={nonce}: stale running (age={age:.0f}s >= "
+                f"{STALE_THRESHOLD}), reclaiming"
+            )
+            jobs.put(
+                nonce,
+                {"status": "running", "started_at": time.time(),
+                 "container": os.environ.get("MODAL_TASK_ID", "reclaim")},
+                skip_if_exists=False,
+            )
+
+        # 2. RUN WORKFLOW via local ComfyUI on :8188 (same container).
+        t0 = time.time()
+        try:
+            result_bytes = self._run_workflow(workflow_json, image_b64, nonce)
+            elapsed = time.time() - t0
+            jobs.put(
+                nonce,
+                {"status": "done", "result": result_bytes,
+                 "finished_at": time.time(), "elapsed": elapsed},
+                skip_if_exists=False,
+            )
+            log.info(
+                f"generate nonce={nonce}: DONE in {elapsed:.1f}s "
+                f"({len(result_bytes)} bytes)"
+            )
+            return result_bytes
+        except Exception as e:
+            elapsed = time.time() - t0
+            err = str(e)[:500]
+            jobs.put(
+                nonce,
+                {"status": "failed", "error": err,
+                 "failed_at": time.time(), "elapsed": elapsed},
+                skip_if_exists=False,
+            )
+            log.exception(f"generate nonce={nonce}: FAILED after {elapsed:.1f}s: {err}")
+            raise
+
+    def _run_workflow(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
+        """Submit workflow to local ComfyUI, poll history, return video bytes.
+
+        flow:
+          1. POST /api/prompt with {prompt: workflow_json, client_id: nonce}
+          2. Poll /api/history/<prompt_id> every 3s until status.completed=true
+             (max wait = local function timeout - 60s buffer)
+          3. Extract output filename from history response
+          4. Read /modal-data/output/
+          5. Explicit volume.commit() — REPLACES R.137 watcher
+          6. Return file bytes
+        """
+        import httpx as _httpx
+
+        # 1. POST /api/prompt
+        client_id = f"r119-{nonce}"
+        if image_b64 and "easy loadImageBase64" in str(workflow_json):
+            # The worker normally injects base64_data into the workflow before
+            # sending. This branch handles cases where image_b64 is provided
+            # separately. We do a minimal injection into the JSON if the
+            # node exists — keeps the API ergonomic.
+            try:
+                wj = workflow_json if isinstance(workflow_json, dict) else _json.loads(workflow_json)
+                for node_id, node in wj.items():
+                    if isinstance(node, dict) and node.get("class_type") == "easy loadImageBase64":
+                        node.setdefault("inputs", {})["base64_data"] = image_b64
+                workflow_json = wj
+            except Exception as e:
+                log.warning(f"_run_workflow: image injection skipped — {e}")
+
+        body = {"prompt": workflow_json, "client_id": client_id}
+        r = _httpx.post(
+            "http://localhost:8188/api/prompt",
+            json=body,
+            timeout=60,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"ComfyUI /api/prompt HTTP {r.status_code}: {r.text[:500]}")
+        prompt_id = r.json().get("prompt_id")
+        if not prompt_id:
+            raise RuntimeError(f"No prompt_id in ComfyUI response: {r.text[:500]}")
+        log.info(f"_run_workflow nonce={nonce} prompt_id={prompt_id}")
+
+        # 2. Poll /api/history/<prompt_id>
+        deadline = time.time() + 870  # 900s timeout - 30s buffer
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                hr = _httpx.get(
+                    f"http://localhost:8188/api/history/{prompt_id}",
+                    timeout=10,
+                )
+                if hr.status_code != 200:
+                    continue
+                hist = hr.json().get(prompt_id)
+                if not hist:
+                    continue
+                status = hist.get("status", {})
+                if status.get("completed", False):
+                    break
+                if status.get("status_str") == "error":
+                    raise RuntimeError(
+                        f"ComfyUI workflow error: {hist.get('status', {})}"
+                    )
+            except _httpx.HTTPError:
+                continue
+        else:
+            raise RuntimeError(f"ComfyUI poll timeout for prompt_id={prompt_id}")
+
+        # 3. Find output file. ComfyUI stores outputs in hist["outputs"][node_id]["videos"|"images"].
+        outputs = hist.get("outputs", {})
+        out_filename = None
+        out_subfolder = ""
+        out_type = "output"
+        for node_out in outputs.values():
+            for kind in ("videos", "images", "gifs"):
+                if kind in node_out and node_out[kind]:
+                    first = node_out[kind][0]
+                    out_filename = first.get("filename")
+                    out_subfolder = first.get("subfolder", "")
+                    out_type = first.get("type", "output")
+                    break
+            if out_filename:
+                break
+
+        if not out_filename:
+            raise RuntimeError(
+                f"No output found in ComfyUI history for prompt_id={prompt_id}: "
+                f"{hist.get('outputs', {})}"
+            )
+
+        # 4. Read file. /ComfyUI/output is symlinked to /modal-data/output.
+        out_path = os.path.join("/modal-data/output", out_subfolder, out_filename) \
+            if out_subfolder else os.path.join("/modal-data/output", out_filename)
+        if not os.path.exists(out_path):
+            # Fall back: scan output dir for new files (handles edge cases where
+            # ComfyUI writes to a different subfolder than reported).
+            log.warning(
+                f"_run_workflow: expected output at {out_path} but not found, "
+                f"scanning /modal-data/output for new files"
+            )
+            current = set(os.listdir("/modal-data/output"))
+            new = current - self._initial_outputs
+            if not new:
+                raise RuntimeError(
+                    f"No output file at {out_path} and no new files in "
+                    f"/modal-data/output since setup"
+                )
+            out_filename = sorted(new)[-1]  # most recent
+            out_path = os.path.join("/modal-data/output", out_filename)
+
+        # Wait briefly for file size to stabilize (ComfyUI may flush in chunks)
+        for _ in range(10):
+            sz1 = os.path.getsize(out_path)
+            time.sleep(1)
+            sz2 = os.path.getsize(out_path)
+            if sz1 == sz2 and sz1 > 0:
+                break
+
+        with open(out_path, "rb") as f:
+            video_bytes = f.read()
+        log.info(f"_run_workflow nonce={nonce} read {len(video_bytes)} bytes from {out_path}")
+
+        # 5. Explicit volume.commit() — replaces R.137 watcher. Sync from
+        # caller's POV once commit() resolves; subsequent /modal-data/output
+        # reads from other containers will see the file.
+        try:
+            h3_models_volume.commit()
+        except Exception as e:
+            # Non-fatal: bytes are already returned to caller; commit is for
+            # Volume-level persistence (cross-container reads).
+            log.warning(f"_run_workflow nonce={nonce} volume.commit() failed: {e}")
+
+        return video_bytes
+
+
+# =============================================================================
+# R.119 (2026-09-05): CPU-only status endpoint. Used by worker on retry to
+# check job state WITHOUT spinning up a GPU container (which would just throw
+# DUPLICATE and burn money). Reads the same Modal Dict as H3Generator.
+# =============================================================================
+@app.function(cpu=1, memory=256, timeout=30)
+def check_job_status(nonce: str) -> dict:
+    existing = jobs.get(nonce)
+    if existing is None:
+        return {"status": "not_found"}
+    # Strip the video bytes — /api/status must return JSON only, and 378KB of
+    # H.264 bytes can't be UTF-8 decoded by FastAPI's JSON encoder. The worker
+    # uses this endpoint only to detect "done" / "failed" / "running" state, not
+    # to fetch the result. Worker should NOT call /api/status after status==done
+    # because the actual bytes came back through /api/run on the original call.
+    slim = {k: v for k, v in existing.items() if k != "result"}
+    return slim
 
 
 # =============================================================================
