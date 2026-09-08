@@ -316,7 +316,15 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # available A100. Modal ASGI gateway is region-agnostic — endpoint URL
     # stays the same; cold-start now hits whichever region responds first.
     # See MEMORY [[modal-regions-failover-2026-08-31]].
-    region=["us-east", "us-west"],
+    #
+    # COST-OPT (2026-09-08): dropped us-west. Task #105 measured 60.1% of H100
+    # cost in hours with ZERO PG gens ($109.53/$182.13), caused by paired
+    # cold-starts in us-east + us-west within <1 sec. us-east H100 capacity
+    # has been stable since H1 transition (no recurrence of original Aug-31
+    # ECONNRESET storm post-Task #94 root cause). Halves cold-start cost.
+    # Rollback: add "us-west" back if "capacity exhausted in us-east" errors
+    # return. See MEMORY [[r119-modal-cost-physical-cause-2026-09-08]].
+    region="us-east",
     # H1 (2026-08-31): A100-80GB → H100 SXM5.
     # A100 pool currently saturated in us-east + us-west (0 active containers,
     # HTTP 303 webhook timeout after 150s). H100 has available capacity.
@@ -652,7 +660,10 @@ def serve():
     max_containers=20,
     buffer_containers=1,
     startup_timeout=600,
-    region=["us-east", "us-west"],
+    # COST-OPT (2026-09-08): us-only-east. See serve() decorator for rationale.
+    # Rollback: add "us-west" back if "capacity exhausted in us-east" errors
+    # return. MEMORY [[r119-modal-cost-physical-cause-2026-09-08]].
+    region="us-east",
     gpu="H100",
 )
 class H3Generator:
