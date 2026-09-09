@@ -290,9 +290,11 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # (30-120s timeout < 110s cold start) AND depends on httpx in default
     # image. Modal's built-in autoscaler handles these correctly:
     #   - min_containers=0      → no idle cost
-    #   - scaledown_window=5    → die fast when idle (was 60 → R.117 2026-09-01)
+    #   - scaledown_window=60   → die after 60s idle (was 5s for /view; serve() keeps 60s)
     #   - max_containers=20     → ceiling under burst
-    #   - buffer_containers=1   → 1 extra ready, no cold-start on burst
+    #   - buffer_containers=0   → REMOVED 2026-09-09 (was 1). Trade-off:
+    #                             deterministic cold/warm > $20-65/mo savings.
+    #                             MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
     # NOTE: `scaleup_window` is NOT a valid Modal SDK param — Modal's
     # built-in autoscaler reacts to demand growth without a tunable delay.
     # (User template included it; removed 2026-08-31.)
@@ -307,7 +309,10 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     min_containers=0,
     scaledown_window=60,
     max_containers=20,
-    buffer_containers=1,
+    # 2026-09-09: buffer_containers REMOVED (was 1). Trade-off: deterministic
+    # cold-start after ≥60s idle > $20-65/mo savings. See MEMORY
+    # [[modal-buffer-removed-permanently-2026-09-09]].
+    buffer_containers=0,
     startup_timeout=600,
     # R1 (2026-08-31): regions failover for A100-80GB pool.
     # Root cause of submit-level ECONNRESET storm: us-east A100 pool was
@@ -658,7 +663,9 @@ def serve():
     min_containers=0,
     scaledown_window=5,
     max_containers=20,
-    buffer_containers=1,
+    # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
+    # MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
+    buffer_containers=0,
     startup_timeout=600,
     # COST-OPT (2026-09-08): us-only-east. See serve() decorator for rationale.
     # Rollback: add "us-west" back if "capacity exhausted in us-east" errors
@@ -1035,9 +1042,10 @@ def check_job_status(nonce: str) -> dict:
 #
 # New design (B0): Modal-native autoscaler on serve() decorator:
 #   - min_containers=0      → no idle cost, pay only for real requests
-#   - scaledown_window=5    → die fast when idle (R.117 2026-09-01, was 60s)
+#   - scaledown_window=60   → die after 60s idle (serve() /api/run); /view uses 5s
 #   - max_containers=20     → ceiling under burst
-#   - buffer_containers=1   → 1 extra ready, no cold-start on burst
+#   - buffer_containers=0   → REMOVED 2026-09-09 (was 1). See serve() comment
+#                             + MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
 # (Modal SDK has no `scaleup_window`; autoscaler reacts to demand growth
 # via its own internal heuristic — typically <1s.)
 #
