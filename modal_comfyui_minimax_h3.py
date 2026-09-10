@@ -580,7 +580,28 @@ def serve():
             raise HTTPException(status_code=400, detail="invalid JSON body")
 
         workflow_json = payload.get("workflow")
+        # === FRAGILE-COMPENSATING-BUG (DO NOT FIX WITHOUT READING MEMORY) ===
+        # Worker sends `imageData` (see apps/worker/src/processors/generation.processor.ts:336
+        # `cachedRequestBody = JSON.stringify({..., imageData, ...}`), but THIS server reads
+        # field name `image` below. Mismatch means image_b64 is ALWAYS empty for the current
+        # R.119 worker path → fallback path at lines 912-924 (`if image_b64 and "easy
+        # loadImageBase64" in str(workflow_json):`) does NOT fire.
+        #
+        # This is GOOD by accident: worker merge() (workflow-builder.ts:262
+        # `matched.inputs[spec.input] = resolved`) already injects correct base64 into
+        # node 220.base64_data BEFORE POST. Fallback would just re-set the same value.
+        # But if fallback DID fire with a DIFFERENT base64 (e.g., wrong field name later
+        # fixed without changing merge() output), it would silently overwrite the correct
+        # value with empty/wrong data and break ref-image generation.
+        #
+        # DO NOT "fix" this mismatch to use `imageData` (or to send `image` from worker)
+        # without simultaneously verifying:
+        #   1. merge() still produces correct base64_data, AND
+        #   2. fallback path semantics still match (re-set to same value, not corrupt)
+        # Otherwise prod breaks. See memory entry
+        # [[reelant-fragile-compensating-bug-image-data-vs-image-2026-09-09]] (Task #149).
         image_b64 = payload.get("image", "") or ""
+        # === END FRAGILE-COMPENSATING-BUG MARKER ===
         nonce = payload.get("nonce")
         if not nonce:
             raise HTTPException(status_code=400, detail="missing nonce")
@@ -614,16 +635,45 @@ def serve():
 
     @web_app.get("/api/status/{nonce}")
     async def api_status(nonce: str):
-        # CPU-only status check — used by worker on retry to avoid burning
-        # GPU on DUPLICATE checks. Returns the jobs[nonce] state dict, or
-        # {"status": "not_found"} if the nonce was never seen.
-        def call_remote():
-            return check_job_status.remote(nonce)
+        # R.119 Task #130 fix (2026-09-09): inline modal.Dict lookup in the
+        # serve() process — eliminates the .remote(check_job_status) chain
+        # which triggered a SEPARATE CPU function cold-start (10-30s, no
+        # enable_memory_snapshot) on top of serve()'s own cold-start (10-30s,
+        # even with snapshot restore) = 76.1s Modal duration for a 2.88s Dict
+        # read (Task #39 trigger #2 gen 8d7f7464 observation, 2026-09-09).
+        #
+        # CRITICAL: `jobs` is `modal.Dict`, which `synchronize_api()`-wraps
+        # `_Dict` (modal/dict.py line 652). The wrapper makes `jobs.get(...)`
+        # SYNCHRONOUS from the user's perspective (value, not coroutine), and
+        # when called from an async context it BLOCKS the FastAPI event loop
+        # with a `_safe_blocking_in_async_warning` (modal/_utils/async_utils.py
+        # line 327). So we MUST wrap in `asyncio.to_thread()` — `await jobs.get(...)`
+        # raises "object NoneType can't be used in 'await' expression" because
+        # the sync value is None (or whatever — it just isn't awaitable).
+        # First v38 deploy tested this with bare `await jobs.get(...)` and
+        # returned HTTP 500 with that TypeError.
+        #
+        # check_job_status standalone function below (line ~1019) is kept
+        # as dead code for backward-compat in this deploy; it can be
+        # deleted in a later commit after this fix is verified stable in
+        # prod for several days.
+        # See MEMORY [[modal-api-status-cold-start-chain-fix-2026-09-09]].
         try:
-            status = await asyncio.to_thread(call_remote)
+            result = await asyncio.to_thread(jobs.get, nonce)
+            if result is None:
+                return {"status": "not_found"}
+            # Strip raw video bytes from JSON response. FastAPI's
+            # jsonable_encoder calls bytes.decode() which raises
+            # UnicodeDecodeError on byte 0xc3 (H.264 stream).
+            # Worker only reads `status`/`error` from /api/status; bytes
+            # flow through /api/run (initial submit OR defensive re-POST
+            # via generate() idempotent path at line 894). Keep `result`
+            # IN the Dict so generate() can still return it on re-POST.
+            # See MEMORY [[reelant-worker-stuck-queue-pre-existing-2026-09-09]].
+            result.pop("result", None)
+            return result
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e)[:500])
-        return status
 
     @web_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
     async def handle(request: Request, path: str):
@@ -892,6 +942,16 @@ class H3Generator:
         # 1. POST /api/prompt
         client_id = f"r119-{nonce}"
         if image_b64 and "easy loadImageBase64" in str(workflow_json):
+            # === FRAGILE-COMPENSATING-BUG (see marker at line 583) ===
+            # Worker normally injects base64_data into workflow BEFORE sending
+            # via merge() (workflow-builder.ts:262). This branch is for callers
+            # who provide image_b64 separately. It re-injects the same field —
+            # normally idempotent. But if the upstream image_b64 is wrong/empty
+            # AND the worker merge() was correct, this OVERWRITES with wrong value.
+            # Currently safe because field-name mismatch (worker: imageData,
+            # server: image) means image_b64 is always empty here. DO NOT enable
+            # this path without re-verifying the data flow.
+            # === END FRAGILE-COMPENSATING-BUG MARKER ===
             # The worker normally injects base64_data into the workflow before
             # sending. This branch handles cases where image_b64 is provided
             # separately. We do a minimal injection into the JSON if the
@@ -1015,6 +1075,23 @@ class H3Generator:
 # R.119 (2026-09-05): CPU-only status endpoint. Used by worker on retry to
 # check job state WITHOUT spinning up a GPU container (which would just throw
 # DUPLICATE and burn money). Reads the same Modal Dict as H3Generator.
+#
+# ⚠️ DEAD CODE (2026-09-09): The /api/status/{nonce} endpoint in serve() above
+# (Task #130 inline jobs.get fix) replaced the call chain that used this
+# function, so this is no longer called. Kept for reference only — DO NOT wire
+# it back up without applying the same strip-result fix.
+#
+# The comment immediately below ("Worker should NOT call /api/status after
+# status==done because the actual bytes came back through /api/run on the
+# original call") is OUTDATED for the current R.119 worker — the worker DOES
+# re-POST /api/run for defensive byte fetch (modal-comfyui.provider.ts
+# fetchCachedBytes), and that path returns cached bytes via generate()'s
+# idempotent branch reading `result` from the Dict (line ~894). So `result`
+# MUST stay in the Dict; only /api/status responses need to strip it.
+#
+# The strip-result fix lives in api_status() above — apply that to any future
+# /api/status implementation. See MEMORY
+# [[reelant-worker-stuck-queue-pre-existing-2026-09-09]].
 # =============================================================================
 @app.function(cpu=1, memory=256, timeout=30)
 def check_job_status(nonce: str) -> dict:
@@ -1024,8 +1101,7 @@ def check_job_status(nonce: str) -> dict:
     # Strip the video bytes — /api/status must return JSON only, and 378KB of
     # H.264 bytes can't be UTF-8 decoded by FastAPI's JSON encoder. The worker
     # uses this endpoint only to detect "done" / "failed" / "running" state, not
-    # to fetch the result. Worker should NOT call /api/status after status==done
-    # because the actual bytes came back through /api/run on the original call.
+    # to fetch the result. (See outdated-comment notice above.)
     slim = {k: v for k, v in existing.items() if k != "result"}
     return slim
 
