@@ -1072,26 +1072,32 @@ class H3Generator:
 
 
 # =============================================================================
-# R.119 (2026-09-05): CPU-only status endpoint. Used by worker on retry to
-# check job state WITHOUT spinning up a GPU container (which would just throw
-# DUPLICATE and burn money). Reads the same Modal Dict as H3Generator.
+# ⚠️ DEAD CODE (Task #130, 2026-09-09, commit 5c92411) — REFERENCE ONLY.
 #
-# ⚠️ DEAD CODE (2026-09-09): The /api/status/{nonce} endpoint in serve() above
-# (Task #130 inline jobs.get fix) replaced the call chain that used this
-# function, so this is no longer called. Kept for reference only — DO NOT wire
-# it back up without applying the same strip-result fix.
+# History:
+#   R.119 (2026-09-05): Originally used by worker on retry to check job state
+#   WITHOUT spinning up a GPU container (which would just throw DUPLICATE and
+#   burn money). Reads the same Modal Dict as H3Generator.
+#   Task #130 (2026-09-09): The /api/status/{nonce} endpoint in serve() above
+#   (lines 614-676) inlines `jobs.get()` via `asyncio.to_thread()`, eliminating
+#   the `.remote(check_job_status)` chain that triggered a SEPARATE CPU
+#   function cold-start (10-30s, no enable_memory_snapshot) on top of
+#   serve()'s own cold-start = 76.1s Modal duration for a 2.88s Dict read
+#   (Task #39 trigger #2 gen 8d7f7464 observation). This function is no
+#   longer called.
 #
-# The comment immediately below ("Worker should NOT call /api/status after
-# status==done because the actual bytes came back through /api/run on the
-# original call") is OUTDATED for the current R.119 worker — the worker DOES
-# re-POST /api/run for defensive byte fetch (modal-comfyui.provider.ts
-# fetchCachedBytes), and that path returns cached bytes via generate()'s
-# idempotent branch reading `result` from the Dict (line ~894). So `result`
-# MUST stay in the Dict; only /api/status responses need to strip it.
+# DO NOT wire back up without porting the strip-result pattern below
+# (line 1105) to the new caller. /api/status can't include the `result` key
+# because FastAPI's jsonable_encoder calls bytes.decode() and raises
+# UnicodeDecodeError on H.264 byte 0xc3. The Dict keeps `result` so
+# generate()'s idempotent branch (line ~894) can return cached bytes via
+# /api/run defensive re-POST (modal-comfyui.provider.ts fetchCachedBytes).
 #
-# The strip-result fix lives in api_status() above — apply that to any future
-# /api/status implementation. See MEMORY
+# Active fix: api_status() above at lines 661-663.
+# See MEMORY [[modal-api-status-cold-start-chain-fix-2026-09-09]] +
 # [[reelant-worker-stuck-queue-pre-existing-2026-09-09]].
+# Safe to delete this block in a follow-up commit once Task #130 is verified
+# stable in prod for several days.
 # =============================================================================
 @app.function(cpu=1, memory=256, timeout=30)
 def check_job_status(nonce: str) -> dict:
