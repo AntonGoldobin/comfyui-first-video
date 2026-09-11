@@ -309,10 +309,23 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     min_containers=0,
     scaledown_window=60,
     max_containers=20,
-    # 2026-09-09: buffer_containers REMOVED (was 1). Trade-off: deterministic
-    # cold-start after ≥60s idle > $20-65/mo savings. See MEMORY
-    # [[modal-buffer-removed-permanently-2026-09-09]].
-    buffer_containers=0,
+    # 2026-09-11: buffer_containers=1 RE-ENABLED (was 0 since 2026-09-09).
+    # Trade-off REVERSED after H3 cold-start root-cause analysis
+    # (see [[modal-h3-cold-start-asgi-snapshot-limitation-2026-09-11]]):
+    #   - serve() uses @modal.asgi_app — ARCHITECTURAL snapshot limit (per
+    #     modal.com/docs/guide/memory-snapshots, snapshots apply only to
+    #     @app.function and @app.cls). serve() therefore pays full 50GB
+    #     Volume→container sync copy (~180s) on every cold-start after
+    #     ≥60s idle. Empirical evidence: 679s anomaly (09-09), 965s
+    #     fetchCachedBytes incident (09-09), >900s worker timeout (09-10).
+    #   - Buffer=1 keeps one warm container alive, eliminates 50GB sync
+    #     from steady-state cold-start latency. Cost: ~$20-65/mo idle H100.
+    #   - Buffer=0 was correct when we believed snapshot would amortize the
+    #     sync — but @modal.asgi_app never gets snapshot, so the math inverted.
+    # Permanent fix is Variant B (consolidate serve() into H3Generator @app.cls
+    # where snapshot works). See OPEN TASK [[h3-cold-start-variant-b-2026-09-11]].
+    # Until B ships, buffer=1 is the cheapest deterministic mitigation.
+    buffer_containers=1,
     startup_timeout=600,
     # R1 (2026-08-31): regions failover for A100-80GB pool.
     # Root cause of submit-level ECONNRESET storm: us-east A100 pool was
