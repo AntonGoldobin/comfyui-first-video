@@ -33,6 +33,10 @@ import time
 import threading
 import logging
 import modal
+# FastAPI imports are deferred to method scope (Task #91) because modal
+# CLI introspects this file locally during `modal deploy`, where fastapi
+# may not be installed. The Modal container itself has fastapi via the
+# sombi base image.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("modal-comfyui-h3")
@@ -274,483 +278,6 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 # =============================================================================
 @app.function(
     image=image,
-    # R.118 (2026-09-01, attempt 2): Prong 1 (dual-mount LoRAs via sub_path)
-    # rejected by Modal — `with_mount_options(sub_path=...)` is treated as a
-    # separate mount and Modal blocks mounting the same Volume twice in one
-    # function ("The same Volume cannot be mounted in multiple locations").
-    # Falling back to Prong 2 only: async background copy for all subdirs.
-    # LoRAs still get copied (~30s of the ~3 min), but ComfyUI boots in parallel
-    # so total cold start is ~30s vs ~3.5 min before. See comment in serve() below.
-    volumes={"/modal-data": h3_models_volume},
-    cpu=4,
-    memory=16384,
-    timeout=1800,
-    # Modal-native autoscaler (B0, 2026-08-31) — replaces B3 prewarm cron.
-    # Prewarm approach failed: cron scheduler's own ping can hit cold ASGI
-    # (30-120s timeout < 110s cold start) AND depends on httpx in default
-    # image. Modal's built-in autoscaler handles these correctly:
-    #   - min_containers=0      → no idle cost
-    #   - scaledown_window=60   → die after 60s idle (was 5s for /view; serve() keeps 60s)
-    #   - max_containers=20     → ceiling under burst
-    #   - buffer_containers=0   → REMOVED 2026-09-09 (was 1). Trade-off:
-    #                             deterministic cold/warm > $20-65/mo savings.
-    #                             MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
-    # NOTE: `scaleup_window` is NOT a valid Modal SDK param — Modal's
-    # built-in autoscaler reacts to demand growth without a tunable delay.
-    # (User template included it; removed 2026-08-31.)
-    #
-    # Memory snapshot (B1, 2026-08-31) — Modal-native checkpoint/restore.
-    # Snapshot is taken after `serve()` body finishes init (model copy +
-    # ComfyUI start). Subsequent cold starts restore from snapshot, skipping
-    # the 60s model copy + 30s ComfyUI init. Reduces cold start from ~90s
-    # to <10s (per Modal docs, up to 12x speedup observed). GPU memory
-    # snapshots are maturing (CPU GA; GPU stable on A100 per 2026-08 docs).
-    enable_memory_snapshot=True,
-    min_containers=0,
-    scaledown_window=60,
-    max_containers=20,
-    # 2026-09-11: buffer_containers=1 RE-ENABLED (was 0 since 2026-09-09).
-    # Trade-off REVERSED after H3 cold-start root-cause analysis
-    # (see [[modal-h3-cold-start-asgi-snapshot-limitation-2026-09-11]]):
-    #   - serve() uses @modal.asgi_app — ARCHITECTURAL snapshot limit (per
-    #     modal.com/docs/guide/memory-snapshots, snapshots apply only to
-    #     @app.function and @app.cls). serve() therefore pays full 50GB
-    #     Volume→container sync copy (~180s) on every cold-start after
-    #     ≥60s idle. Empirical evidence: 679s anomaly (09-09), 965s
-    #     fetchCachedBytes incident (09-09), >900s worker timeout (09-10).
-    #   - Buffer=1 keeps one warm container alive, eliminates 50GB sync
-    #     from steady-state cold-start latency. Cost: ~$20-65/mo idle H100.
-    #   - Buffer=0 was correct when we believed snapshot would amortize the
-    #     sync — but @modal.asgi_app never gets snapshot, so the math inverted.
-    # Permanent fix is Variant B (consolidate serve() into H3Generator @app.cls
-    # where snapshot works). See OPEN TASK [[h3-cold-start-variant-b-2026-09-11]].
-    # Until B ships, buffer=1 is the cheapest deterministic mitigation.
-    buffer_containers=1,
-    startup_timeout=600,
-    # R1 (2026-08-31): regions failover for A100-80GB pool.
-    # Root cause of submit-level ECONNRESET storm: us-east A100 pool was
-    # over-committed (0 active containers despite app 'deployed'). Adding
-    # us-west as alternative lets Modal scheduler pick whichever region has
-    # available A100. Modal ASGI gateway is region-agnostic — endpoint URL
-    # stays the same; cold-start now hits whichever region responds first.
-    # See MEMORY [[modal-regions-failover-2026-08-31]].
-    #
-    # COST-OPT (2026-09-08): dropped us-west. Task #105 measured 60.1% of H100
-    # cost in hours with ZERO PG gens ($109.53/$182.13), caused by paired
-    # cold-starts in us-east + us-west within <1 sec. us-east H100 capacity
-    # has been stable since H1 transition (no recurrence of original Aug-31
-    # ECONNRESET storm post-Task #94 root cause). Halves cold-start cost.
-    # Rollback: add "us-west" back if "capacity exhausted in us-east" errors
-    # return. See MEMORY [[r119-modal-cost-physical-cause-2026-09-08]].
-    region="us-east",
-    # H1 (2026-08-31): A100-80GB → H100 SXM5.
-    # A100 pool currently saturated in us-east + us-west (0 active containers,
-    # HTTP 303 webhook timeout after 150s). H100 has available capacity.
-    # Bonus: H100 + Sage Attention 2 (entrypoint flag) = 2.85x faster
-    # inference (256s → ~90s for mystic@0.7 portrait). H100's higher
-    # $/sec is OFFSET by 2x speedup → $0.099/gen vs $0.178/gen on A100
-    # (−44% per gen). See MEMORY [[reelant-modal-h100-sage-attention-2026-08-31]].
-    gpu="H100",
-)
-@modal.asgi_app()
-def serve():
-    """ASGI app exposing ComfyUI HTTP API on Modal for H3."""
-    from fastapi import FastAPI, Request, HTTPException, Response
-    import httpx
-
-    log.info("=== Starting ComfyUI (H3) on Modal ===")
-    import subprocess
-    # Symlink so any internal /runpod-volume paths in custom nodes work
-    if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
-        os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
-    # Find python
-    python_bin = None
-    for cand in [
-        "/venv/bin/python3",
-        "/venv/bin/python",
-        "/opt/venv/bin/python",
-        "/usr/bin/python3",
-        "/usr/local/bin/python3",
-    ]:
-        if os.path.exists(cand) and os.access(cand, os.X_OK):
-            python_bin = cand
-            break
-    if not python_bin:
-        import shutil
-        python_bin = shutil.which("python3") or shutil.which("python")
-    if not python_bin:
-        raise RuntimeError("No python interpreter found in container")
-    log.info(f"Using python: {python_bin}")
-
-    # Copy models from Modal Volume to /ComfyUI/models/. ComfyUI's scanner does
-    # not follow symlinks across mount boundaries, so we must copy.
-    import shutil
-
-    def copy_dir_contents(src_dir: str, dst_dir: str):
-        if not os.path.isdir(src_dir):
-            return
-        os.makedirs(dst_dir, exist_ok=True)
-        for fname in os.listdir(dst_dir):
-            p = f"{dst_dir}/{fname}"
-            if os.path.islink(p):
-                try:
-                    p_real = os.path.realpath(p)
-                    if p_real.startswith("/modal-data"):
-                        log.info(f"Removing stale symlink {p} → {p_real}")
-                        os.unlink(p)
-                except Exception:
-                    pass
-        for fname in os.listdir(src_dir):
-            src = f"{src_dir}/{fname}"
-            dst = f"{dst_dir}/{fname}"
-            if os.path.isfile(dst) and not os.path.islink(dst):
-                continue
-            if os.path.islink(dst):
-                continue
-            if os.path.isdir(src):
-                copy_dir_contents(src, dst)
-                continue
-            log.info(f"Copying {src} → {dst}")
-            shutil.copy2(src, dst)
-            log.info(f"Copied ({os.path.getsize(dst)/1e9:.2f} GB)")
-
-    # H3 files live under text_encoders/, diffusion_models/, vae/, loras/, latent_upscale_models/.
-    # R.131 (2026-09-03): FULL SYNCHRONOUS copy — async path from R.118 was unreliable.
-    # Direct curl POST /api/prompt after cold start consistently returned
-    # `prompt_outputs_failed_validation` with empty checkpoints list, even after
-    # waiting 5 minutes. Async thread was either killed by Modal snapshot serialize
-    # or never completed for unknown reasons. Sync adds ~3 min to first cold start
-    # but makes reliability 100% — every cold start has all models on disk before
-    # ComfyUI boots. enable_memory_snapshot will then snapshot fully-populated state.
-    all_subs = ("diffusion_models", "text_encoders", "vae", "loras", "latent_upscale_models", "checkpoints")
-    for sub in all_subs:
-        os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
-        os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
-
-    log.info(f"Sync copy of all models (~50 GB / ~3 min) — blocks ComfyUI boot for reliability")
-    for sub in all_subs:
-        src_files = os.listdir(f"/modal-data/models/{sub}") if os.path.isdir(f"/modal-data/models/{sub}") else []
-        log.info(f"  {sub}: {len(src_files)} files in volume, copying to /ComfyUI/models/{sub}/")
-        copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
-    log.info("Full sync copy complete — all models on disk before ComfyUI starts")
-
-    # Persist output to Modal Volume so it survives container scaledown
-    os.makedirs("/modal-data/output", exist_ok=True)
-    if os.path.islink("/ComfyUI/output") or os.path.isdir("/ComfyUI/output"):
-        if os.path.islink("/ComfyUI/output"):
-            os.unlink("/ComfyUI/output")
-        else:
-            shutil.rmtree("/ComfyUI/output")
-    os.symlink("/modal-data/output", "/ComfyUI/output")
-    log.info("Linked /ComfyUI/output → /modal-data/output")
-
-    # Launch ComfyUI on :8188.
-    # 2026-08-31 (revert from --use-sage-attention + --fp8_e4m3fn-unet):
-    #   Both flags broke MiniMax-H3 because the rms_rope_split_half_ kernel
-    #   in comfy.quant_ops.ck rejects fp8 q_scale tensors (NoCapableBackendError
-    #   in node 151 SamplerCustomAdvanced). The rope op only accepts bf16/fp32/fp16
-    #   for q_scale. Last WORKING config: native int8 weights + comfy kitchen attention,
-    #   no CLI flags. Cost: ~256s for mystic@0.7 portrait (vs ~90s with SA2+fp8).
-    #   Pending: ask upstream for sage kernel that handles fp8 q_scale, or cast
-    #   q_scale→bf16 in post-load hook. See MEMORY + .workflow-scratch/ for context.
-    log_file = open("/tmp/comfy.log", "w")
-    proc = subprocess.Popen(
-        [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1", "--port", "8188",
-         "--disable-auto-launch", "--gpu-only",
-         "--output-directory", "/modal-data/output"],
-        stdout=log_file, stderr=subprocess.STDOUT,
-    )
-    log.info(f"ComfyUI PID: {proc.pid}")
-
-    # Wait for ComfyUI ready (max 10 min for cold start)
-    for i in range(600):
-        try:
-            r = httpx.get("http://localhost:8188/system_stats", timeout=2)
-            if r.status_code == 200:
-                log.info(f"ComfyUI ready after {i+1}s")
-                break
-        except Exception:
-            pass
-        if i > 0 and i % 30 == 0:
-            try:
-                with open("/tmp/comfy.log") as f:
-                    tail = f.read()[-2000:]
-                log.info(f"[comfy.log tail @ {i}s]\n{tail}")
-            except Exception:
-                pass
-        time.sleep(1)
-    else:
-        log.error("ComfyUI did not start within 600s")
-        try:
-            with open("/tmp/comfy.log") as f:
-                log.error(f.read())
-        except Exception:
-            pass
-        raise RuntimeError("ComfyUI startup timeout")
-
-    # R.137 (2026-09-03): background watcher that commits the Modal Volume after
-    # ComfyUI SaveVideo writes a video file. Without explicit commit, /view lookups
-    # from other containers (including cold-starts after scaledown) hit a 200/404
-    # race window of 17-30s+ because the Modal Volume sync is asynchronous.
-    # Strategy: poll /modal-data/output every 500ms; when a new .mp4 appears,
-    # wait until its size is stable for 2s (write complete), then commit.
-    # Idempotent — volume.commit() is a no-op if nothing changed since last commit.
-    import threading
-    OUTPUT_DIR = "/modal-data/output"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    known_files: dict[str, int] = {}  # filename -> size at last commit
-
-    def volume_commit_watcher():
-        log.info("=== R.137 volume_commit_watcher started ===")
-        while True:
-            try:
-                current_files: dict[str, int] = {}
-                for fname in os.listdir(OUTPUT_DIR):
-                    if not (fname.endswith(".mp4") or fname.endswith(".webm") or fname.endswith(".mov")):
-                        continue
-                    fpath = os.path.join(OUTPUT_DIR, fname)
-                    if not os.path.isfile(fpath):
-                        continue
-                    try:
-                        current_files[fname] = os.path.getsize(fpath)
-                    except OSError:
-                        continue
-                # Find new files (or files whose size grew since last commit)
-                to_commit: list[str] = []
-                for fname, size in current_files.items():
-                    if fname not in known_files or known_files[fname] != size:
-                        to_commit.append(fname)
-                if to_commit:
-                    # Wait 2s and re-check size to ensure file write is complete
-                    time.sleep(2)
-                    stable_files: list[str] = []
-                    for fname in to_commit:
-                        fpath = os.path.join(OUTPUT_DIR, fname)
-                        try:
-                            new_size = os.path.getsize(fpath)
-                            if new_size == current_files[fname]:
-                                stable_files.append(fname)
-                        except OSError:
-                            continue
-                    if stable_files:
-                        try:
-                            h3_models_volume.commit()
-                            for fname in stable_files:
-                                known_files[fname] = current_files[fname]
-                            log.info(f"R.137 committed {len(stable_files)} new/stable file(s): {stable_files[:3]}")
-                        except Exception as ce:
-                            log.warning(f"R.137 volume.commit() failed: {ce}")
-            except Exception as e:
-                log.warning(f"R.137 watcher loop error: {e}")
-            time.sleep(0.5)
-
-    watcher_thread = threading.Thread(target=volume_commit_watcher, daemon=True, name="volume-commit-watcher")
-    watcher_thread.start()
-    log.info("R.137 volume_commit_watcher thread spawned")
-
-    web_app = FastAPI(title="ComfyUI MiniMax-H3 on Modal")
-
-    async def proxy(request: Request, path: str) -> Response:
-        body = await request.body()
-        url = f"http://localhost:8188/{path}"
-        skip = {"host", "content-length", "connection", "accept-encoding"}
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
-        try:
-            async with httpx.AsyncClient(timeout=1800) as client:
-                r = await client.request(
-                    method=request.method, url=url, content=body,
-                    headers=headers, params=request.query_params,
-                )
-            return Response(
-                content=r.content, status_code=r.status_code,
-                media_type=r.headers.get("content-type", "application/octet-stream"),
-            )
-        except Exception as e:
-            log.exception("ComfyUI proxy error")
-            raise HTTPException(status_code=502, detail=f"ComfyUI proxy error: {e}")
-
-    # =============================================================================
-    # R.119 (2026-09-05): NEW /api/run + /api/status/{nonce} endpoints.
-    # Worker calls POST /api/run instead of POST /api/prompt + poll /api/history +
-    # GET /api/view. The proxy below remains intact for backward compat — old
-    # clients keep working. /api/run invokes H3Generator().generate.remote(...)
-    # via asyncio.to_thread, which blocks until the GPU container returns
-    # video bytes (or raises an idempotency error).
-    #
-    # MUST be registered BEFORE the catch-all api_route("/{path:path}") below —
-    # FastAPI/Starlette first-match routing, so the catch-all shadows literal
-    # paths declared after it.
-    # =============================================================================
-    import asyncio
-    import json as _json
-
-    @web_app.post("/api/run")
-    async def api_run(request: Request):
-        body = await request.body()
-        try:
-            payload = _json.loads(body) if body else {}
-        except Exception:
-            raise HTTPException(status_code=400, detail="invalid JSON body")
-
-        workflow_json = payload.get("workflow")
-        # === FRAGILE-COMPENSATING-BUG (DO NOT FIX WITHOUT READING MEMORY) ===
-        # Worker sends `imageData` (see apps/worker/src/processors/generation.processor.ts:336
-        # `cachedRequestBody = JSON.stringify({..., imageData, ...}`), but THIS server reads
-        # field name `image` below. Mismatch means image_b64 is ALWAYS empty for the current
-        # R.119 worker path → fallback path at lines 912-924 (`if image_b64 and "easy
-        # loadImageBase64" in str(workflow_json):`) does NOT fire.
-        #
-        # This is GOOD by accident: worker merge() (workflow-builder.ts:262
-        # `matched.inputs[spec.input] = resolved`) already injects correct base64 into
-        # node 220.base64_data BEFORE POST. Fallback would just re-set the same value.
-        # But if fallback DID fire with a DIFFERENT base64 (e.g., wrong field name later
-        # fixed without changing merge() output), it would silently overwrite the correct
-        # value with empty/wrong data and break ref-image generation.
-        #
-        # DO NOT "fix" this mismatch to use `imageData` (or to send `image` from worker)
-        # without simultaneously verifying:
-        #   1. merge() still produces correct base64_data, AND
-        #   2. fallback path semantics still match (re-set to same value, not corrupt)
-        # Otherwise prod breaks. See memory entry
-        # [[reelant-fragile-compensating-bug-image-data-vs-image-2026-09-09]] (Task #149).
-        image_b64 = payload.get("image", "") or ""
-        # === END FRAGILE-COMPENSATING-BUG MARKER ===
-        nonce = payload.get("nonce")
-        if not nonce:
-            raise HTTPException(status_code=400, detail="missing nonce")
-        if not workflow_json:
-            raise HTTPException(status_code=400, detail="missing workflow")
-
-        log.info(f"/api/run nonce={nonce} workflow_keys={list(workflow_json.keys())[:3] if isinstance(workflow_json, dict) else type(workflow_json).__name__}")
-
-        # Mirror Step 0.5 verified pattern: .remote() blocks inside asyncio.to_thread
-        # so the FastAPI event loop stays responsive. Worker @nestjs/axios timeout
-        # is 900s — same envelope as Modal function timeout.
-        def call_remote():
-            return H3Generator().generate.remote(workflow_json, image_b64, nonce)
-
-        t0 = time.time()
-        try:
-            result_bytes = await asyncio.to_thread(call_remote)
-        except Exception as e:
-            elapsed = time.time() - t0
-            log.exception(f"/api/run nonce={nonce} failed after {elapsed:.1f}s")
-            # Surface the exception message — worker uses it for idempotency
-            # decision-making (DUPLICATE / PREVIOUS_ATTEMPT_FAILED / etc.).
-            raise HTTPException(status_code=500, detail=str(e)[:1000])
-        elapsed = time.time() - t0
-        log.info(f"/api/run nonce={nonce} returned {len(result_bytes)} bytes after {elapsed:.1f}s")
-        return Response(
-            content=result_bytes,
-            media_type="video/mp4",
-            headers={"X-Nonce": nonce, "X-Elapsed": f"{elapsed:.1f}"},
-        )
-
-    @web_app.get("/api/status/{nonce}")
-    async def api_status(nonce: str):
-        # Task #135 (2026-09-10): /api/status has been extracted to a dedicated
-        # @modal.fastapi_endpoint() function `api_status_endpoint` (see top-level
-        # function above) for enable_memory_snapshot support. THIS handler stays
-        # live for the ROLLBACK WINDOW (24-48h after new endpoint is verified
-        # stable) so worker on old MODAL_COMFYUI_BASE_URL (without MODAL_STATUS_URL
-        # set) still works. Remove in a follow-up commit once new endpoint is
-        # confirmed stable in prod.
-        #
-        # R.119 Task #130 fix (2026-09-09): inline modal.Dict lookup in the
-        # serve() process — eliminates the .remote(check_job_status) chain
-        # which triggered a SEPARATE CPU function cold-start (10-30s, no
-        # enable_memory_snapshot) on top of serve()'s own cold-start (10-30s,
-        # even with snapshot restore) = 76.1s Modal duration for a 2.88s Dict
-        # read (Task #39 trigger #2 gen 8d7f7464 observation, 2026-09-09).
-        #
-        # CRITICAL: `jobs` is `modal.Dict`, which `synchronize_api()`-wraps
-        # `_Dict` (modal/dict.py line 652). The wrapper makes `jobs.get(...)`
-        # SYNCHRONOUS from the user's perspective (value, not coroutine), and
-        # when called from an async context it BLOCKS the FastAPI event loop
-        # with a `_safe_blocking_in_async_warning` (modal/_utils/async_utils.py
-        # line 327). So we MUST wrap in `asyncio.to_thread()` — `await jobs.get(...)`
-        # raises "object NoneType can't be used in 'await' expression" because
-        # the sync value is None (or whatever — it just isn't awaitable).
-        # First v38 deploy tested this with bare `await jobs.get(...)` and
-        # returned HTTP 500 with that TypeError.
-        #
-        # check_job_status standalone function below (line ~1019) is kept
-        # as dead code for backward-compat in this deploy; it can be
-        # deleted in a later commit after this fix is verified stable in
-        # prod for several days.
-        # See MEMORY [[modal-api-status-cold-start-chain-fix-2026-09-09]].
-        try:
-            result = await asyncio.to_thread(jobs.get, nonce)
-            if result is None:
-                return {"status": "not_found"}
-            # Strip raw video bytes from JSON response. FastAPI's
-            # jsonable_encoder calls bytes.decode() which raises
-            # UnicodeDecodeError on byte 0xc3 (H.264 stream).
-            # Worker only reads `status`/`error` from /api/status; bytes
-            # flow through /api/run (initial submit OR defensive re-POST
-            # via generate() idempotent path at line 894). Keep `result`
-            # IN the Dict so generate() can still return it on re-POST.
-            # See MEMORY [[reelant-worker-stuck-queue-pre-existing-2026-09-09]].
-            result.pop("result", None)
-            return result
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e)[:500])
-
-    @web_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-    async def handle(request: Request, path: str):
-        return await proxy(request, path)
-
-    return web_app
-
-
-# =============================================================================
-# Task #135 (2026-09-10): extract /api/status to @modal.fastapi_endpoint().
-#
-# WHY: Task #133 finding — @modal.asgi_app (used by serve()) NEVER receives CPU
-# memory snapshot on Modal (platform restriction documented in
-# https://modal.com/docs/guide/memory-snapshots — snapshots apply to
-# @app.function and @app.cls). serve() therefore pays full cold-start (~30-60s)
-# on every /api/status call after scaledown, even though /api/status only does
-# a 2-3s modal.Dict read. Empirical dummy test (2026-09-09) showed
-# @modal.fastapi_endpoint + enable_memory_snapshot=True restores in ~8s.
-#
-# INTENTIONALLY SYNCHRONOUS (def, NOT async def):
-#   modal.Dict is sync_api-wrapped — `jobs.get(...)` returns a value, NOT a
-#   coroutine. Task #130 v38 bug was caused by `await jobs.get(...)` from inside
-#   an async def handler — `await None` raised "object NoneType can't be used
-#   in 'await' expression" (TypeError 500). Making this function sync sidesteps
-#   that entire class of bugs. DO NOT refactor to async def without first
-#   re-reading Task #130 history.
-#
-# URL pattern — MODAL API LIMITATION (verified 2026-09-10, see MEMORY
-# [[modal-fastapi-endpoint-no-path-arg-2026-09-10]]):
-#   @modal.fastapi_endpoint() signature: method, label, custom_domains, docs,
-#   requires_proxy_auth. NO path= argument. Function args become QUERY PARAMS
-#   by default (FastAPI's default). Even with `from fastapi import Path` +
-#   `nonce: str = Path(...)` annotation, URL is at most /{nonce} (single
-#   segment) — cannot get `/api/status/{nonce}` style multi-segment paths.
-#   The OLD `/api/status/{nonce}` URL pattern from serve() CANNOT be replicated
-#   here without @modal.asgi_app() — but @modal.asgi_app() disables memory
-#   snapshot (Task #133 finding), defeating the entire purpose of this refactor.
-#
-#   So this endpoint exposes URL `/?nonce={nonce}` (verified cold 8s, warm 0.9s).
-#   Worker URL construction (see modal-comfyui.provider.ts):
-#     new endpoint: `${MODAL_STATUS_URL}/?nonce=${encodeURIComponent(nonce)}`
-#     fallback:     `${MODAL_COMFYUI_BASE_URL}/api/status/${encodeURIComponent(nonce)}`
-#   Two URL patterns in worker are required by this Modal API limit — see
-#   FOLLOW-UP task #48 to remove branching logic when serve() handler is deleted.
-#
-# URL (auto-generated by Modal from function name):
-#   https://anton722451--comfyui-minimax-h3-api-status-endpoint.modal.run
-#   Worker learns this URL via MODAL_STATUS_URL env var (set via CapRover).
-#   Default = MODAL_COMFYUI_BASE_URL (backward compat during rollback window).
-#
-# ROLLBACK WINDOW: serve().api_status() handler below stays live and unchanged
-# until 24-48h after this endpoint is verified stable, then removed in a
-# follow-up commit (Task #48, paired with worker branching removal).
-# =============================================================================
-@app.function(
-    image=image,
     secrets=_R119_SECRETS,
     cpu=1,
     memory=256,
@@ -821,7 +348,7 @@ def api_status_endpoint(nonce: str) -> dict:
     gpu="H100",
 )
 class H3Generator:
-    @modal.enter()
+    @modal.enter(snap=True)
     def setup(self):
         """Initialize GPU container once per cold start. Symlinks models,
         launches ComfyUI subprocess on :8188, waits for ready. Snapshotted."""
@@ -1021,6 +548,86 @@ class H3Generator:
             )
             log.exception(f"generate nonce={nonce}: FAILED after {elapsed:.1f}s: {err}")
             raise
+
+    @modal.fastapi_endpoint(method="POST")
+    def api_run(self, payload: dict) -> dict:
+        """Task #91 (2026-09-12): consolidate serve() ASGI into H3Generator.
+
+        Replaces the old @modal.asgi_app serve() function with an
+        @modal.fastapi_endpoint on the class itself. Two wins:
+          - ONE container (H3Generator's) per generation instead of two
+            (serve() had its own @app.function cold-start separate from
+            H3Generator's). Saves ~30-60s of serve() cold-start.
+          - enable_memory_snapshot works here (asgi_app() never did —
+            documented Modal restriction).
+
+        URL: Modal auto-names this as <app>-<class>-<method>.modal.run:
+            https://anton722451--comfyui-minimax-h3-h3generator-api-run.modal.run
+        Worker calls this URL directly (no /api/run suffix — it's now the
+        root of the endpoint).
+
+        Signature uses Modal's recommended pattern — `payload: dict` directly
+        (NOT `request: Request`). Modal/FastAPI introspects the signature and
+        sees `dict` → treats the JSON body as the dict. With `Request` in the
+        signature, FastAPI treats `request` as a query parameter (returns 422).
+        sync `def` is fine here: payload parsing is automatic; the heavy work
+        (generate.local) is sync; .local() blocks this thread, not an event loop.
+        """
+        from fastapi import HTTPException
+
+        workflow_json = payload.get("workflow")
+        # === FRAGILE-COMPENSATING-BUG (DO NOT FIX WITHOUT READING MEMORY) ===
+        # Worker sends `imageData` (see apps/worker/src/processors/generation.processor.ts:336
+        # `cachedRequestBody = JSON.stringify({..., imageData, ...}`), but THIS server reads
+        # field name `image` below. Mismatch means image_b64 is ALWAYS empty for the current
+        # R.119 worker path → fallback path at lines 912-924 (`if image_b64 and "easy
+        # loadImageBase64" in str(workflow_json):`) does NOT fire.
+        #
+        # This is GOOD by accident: worker merge() (workflow-builder.ts:262
+        # `matched.inputs[spec.input] = resolved`) already injects correct base64 into
+        # node 220.base64_data BEFORE POST. Fallback would just re-set the same value.
+        # But if fallback DID fire with a DIFFERENT base64 (e.g., wrong field name later
+        # fixed without changing merge() output), it would silently overwrite the correct
+        # value with empty/wrong data and break ref-image generation.
+        #
+        # DO NOT "fix" this mismatch to use `imageData` (or to send `image` from worker)
+        # without simultaneously verifying:
+        #   1. merge() still produces correct base64_data, AND
+        #   2. fallback path semantics still match (re-set to same value, not corrupt)
+        # Otherwise prod breaks. See memory entry
+        # [[reelant-fragile-compensating-bug-image-data-vs-image-2026-09-09]] (Task #149).
+        image_b64 = payload.get("image", "") or ""
+        # === END FRAGILE-COMPENSATING-BUG MARKER ===
+        nonce = payload.get("nonce")
+        if not nonce:
+            raise HTTPException(status_code=400, detail="missing nonce")
+        if not workflow_json:
+            raise HTTPException(status_code=400, detail="missing workflow")
+
+        log.info(f"api_run nonce={nonce} workflow_keys={list(workflow_json.keys())[:3] if isinstance(workflow_json, dict) else type(workflow_json).__name__}")
+
+        # Task #91: .local() (NOT .remote()) — Modal SDK descriptor protocol:
+        # @modal.method() decorated methods must be invoked via .local() or .remote().
+        # Since we're inside the class's own container, .local() is the canonical
+        # pattern (no network hop, no separate cold-start).
+        t0 = time.time()
+        try:
+            result_bytes = self.generate.local(workflow_json, image_b64, nonce)
+        except Exception as e:
+            elapsed = time.time() - t0
+            log.exception(f"api_run nonce={nonce} failed after {elapsed:.1f}s")
+            # Surface the exception message — worker uses it for idempotency
+            # decision-making (DUPLICATE / PREVIOUS_ATTEMPT_FAILED / etc.).
+            raise HTTPException(status_code=500, detail=str(e)[:1000])
+        elapsed = time.time() - t0
+        log.info(f"api_run nonce={nonce} returned {len(result_bytes)} bytes after {elapsed:.1f}s")
+        import base64 as _b64
+        return {
+            "video_b64": _b64.b64encode(result_bytes).decode("ascii"),
+            "elapsed_s": round(elapsed, 2),
+            "size_bytes": len(result_bytes),
+            "nonce": nonce,
+        }
 
     def _run_workflow(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
         """Submit workflow to local ComfyUI, poll history, return video bytes.
