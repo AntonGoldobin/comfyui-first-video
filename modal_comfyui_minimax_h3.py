@@ -354,6 +354,8 @@ class H3Generator:
         launches ComfyUI subprocess on :8188, waits for ready. Snapshotted."""
         import subprocess
         import shutil
+        import pathlib
+        import re
 
         log.info("=== H3Generator.setup() — initializing GPU container ===")
 
@@ -425,6 +427,68 @@ class H3Generator:
                 shutil.rmtree("/ComfyUI/output")
         os.symlink("/modal-data/output", "/ComfyUI/output")
         log.info("Linked /ComfyUI/output → /modal-data/output")
+
+        # ------------------------------------------------------------------
+        # Task #216 (2026-09-13): defer eager CUDA init in comfy.model_management.
+        # Root cause: `main.py:239` imports `comfy.model_management`, which at
+        # module-load runs `total_vram = get_total_memory(get_torch_device())`.
+        # `get_torch_device()` calls `torch.cuda.current_device()` →
+        # `torch._C._cuda_init()`. After a Modal @modal.enter(snap=True)
+        # snapshot restore, GPU memory state is NOT in the snapshot (Modal
+        # docs explicit). On the first import post-restore, the GPU may not
+        # be bound yet → RuntimeError("No CUDA GPUs are available"). ComfyUI
+        # crashes BEFORE its HTTP server starts → setup()'s /system_stats
+        # poll loops 600× → RuntimeError("ComfyUI startup timeout").
+        #
+        # Fix: wrap the eager init in try/except RuntimeError. On failure,
+        # `total_vram = 0`. On Linux (Modal runs Linux), `total_vram` is only
+        # read in a Windows-only VRAM-reservation branch; the only Linux
+        # effect is a slightly different startup log line.
+        #
+        # Idempotent: sentinel comment check skips re-runs. Re-runs on a
+        # new ComfyUI version that preserves the line shape will re-patch
+        # automatically. setup() runs every cold-start, so image rebuilds
+        # are not required.
+        # ------------------------------------------------------------------
+        _mm_path = pathlib.Path("/ComfyUI/comfy/model_management.py")
+        _SENTINEL = "# H3_TASK216_PATCH: deferred_cuda_init"
+        try:
+            _mm_src = _mm_path.read_text()
+            if _SENTINEL in _mm_src:
+                log.info("model_management.py: H3_TASK216 patch already applied — skipping")
+            else:
+                _pattern = re.compile(
+                    r"^(\s*)total_vram\s*=\s*get_total_memory\(get_torch_device\(\)\)\s*/\s*\(1024\s*\*\s*1024\)\s*$",
+                    re.MULTILINE,
+                )
+                _m = _pattern.search(_mm_src)
+                if _m:
+                    _indent = _m.group(1)
+                    _replacement = (
+                        f"{_indent}# H3_TASK216_PATCH: deferred_cuda_init\n"
+                        f"{_indent}try:\n"
+                        f"{_indent}    total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)\n"
+                        f"{_indent}except RuntimeError as _e3_init_err:\n"
+                        f"{_indent}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        f"{_indent}    # First import post-restore can race the GPU bind. Defer to 0;\n"
+                        f"{_indent}    # total_vram is only read in Windows-only VRAM-reservation logic,\n"
+                        f"{_indent}    # so on Linux this only affects the startup log line.\n"
+                        f"{_indent}    total_vram = 0\n"
+                        f"{_indent}    logging.warning(\n"
+                        f"{_indent}        \"H3_TASK216: deferred CUDA init in comfy.model_management: %s\",\n"
+                        f"{_indent}        _e3_init_err,\n"
+                        f"{_indent}    )"
+                    )
+                    _new_src = _mm_src[:_m.start()] + _replacement + _mm_src[_m.end():]
+                    _mm_path.write_text(_new_src)
+                    log.info("model_management.py: applied H3_TASK216 deferred-CUDA-init patch")
+                else:
+                    log.warning(
+                        "model_management.py: H3_TASK216 pattern not found — "
+                        "ComfyUI version may have changed; leaving file unchanged"
+                    )
+        except Exception as _patch_err:
+            log.warning(f"model_management.py: H3_TASK216 patcher failed: {_patch_err}")
 
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
         import httpx as _httpx
