@@ -490,6 +490,70 @@ class H3Generator:
         except Exception as _patch_err:
             log.warning(f"model_management.py: H3_TASK216 patcher failed: {_patch_err}")
 
+        # ------------------------------------------------------------------
+        # Task #216b (2026-09-13): defer eager CUDA init in
+        # get_torch_device() itself. The first patcher covered the
+        # `total_vram` lookup at line 363, but ComfyUI's startup reaches
+        # `get_torch_device()` EARLIER — `cuda_malloc_warning()` at
+        # main.py:286 calls `get_torch_device()` at module load, which
+        # runs `torch.cuda.current_device()` at the line below BEFORE the
+        # patched line 363 ever runs. After a Modal snapshot restore, the
+        # GPU is not yet bound → RuntimeError("No CUDA GPUs are
+        # available") → ComfyUI crashes before HTTP server starts.
+        #
+        # Fix: wrap the `torch.cuda.current_device()` call inside the
+        # else-branch fallback of get_torch_device() in try/except
+        # RuntimeError. On failure, fall back to torch.device("cpu").
+        # cpu_state will then take the CPU branch on the next call, but
+        # at least import succeeds and the HTTP server starts.
+        #
+        # Idempotent: same sentinel-skipped re-run pattern as Task #216.
+        # ------------------------------------------------------------------
+        _SENTINEL_2 = "# H3_TASK216_PATCH_GET_TORCH_DEVICE: deferred_cuda_init"
+        try:
+            _mm_src = _mm_path.read_text()
+            if _SENTINEL_2 in _mm_src:
+                log.info("model_management.py: H3_TASK216b patch already applied — skipping")
+            else:
+                # Match the bare CUDA branch in get_torch_device()'s else-fallback.
+                # Anchored on the leading 12-space indent (inside `else:` of the
+                # function body) so we don't accidentally match a similar line
+                # elsewhere. The line is unique in model_management.py.
+                _pattern2 = re.compile(
+                    r"^( {12})return torch\.device\(torch\.cuda\.current_device\(\)\)\s*$",
+                    re.MULTILINE,
+                )
+                _m2 = _pattern2.search(_mm_src)
+                if _m2:
+                    _indent2 = _m2.group(1)
+                    _replacement2 = (
+                        f"{_indent2}# H3_TASK216_PATCH_GET_TORCH_DEVICE: deferred_cuda_init\n"
+                        f"{_indent2}try:\n"
+                        f"{_indent2}    return torch.device(torch.cuda.current_device())\n"
+                        f"{_indent2}except RuntimeError as _e212_init_err:\n"
+                        f"{_indent2}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        f"{_indent2}    # get_torch_device() is called at module load by cuda_malloc_warning(),\n"
+                        f"{_indent2}    # BEFORE the previously-patched line 363 ever runs. Fall back to CPU\n"
+                        f"{_indent2}    # so ComfyUI import succeeds and the HTTP server can start; the next\n"
+                        f"{_indent2}    # get_torch_device() call (after snap restore completes GPU bind) will\n"
+                        f"{_indent2}    # return the real GPU device normally.\n"
+                        f"{_indent2}    logging.warning(\n"
+                        f"{_indent2}        \"H3_TASK216b: deferred CUDA init in get_torch_device(): %s\",\n"
+                        f"{_indent2}        _e212_init_err,\n"
+                        f"{_indent2}    )\n"
+                        f"{_indent2}    return torch.device(\"cpu\")"
+                    )
+                    _new_src = _mm_src[:_m2.start()] + _replacement2 + _mm_src[_m2.end():]
+                    _mm_path.write_text(_new_src)
+                    log.info("model_management.py: applied H3_TASK216b deferred-CUDA-init patch (get_torch_device line 212)")
+                else:
+                    log.warning(
+                        "model_management.py: H3_TASK216b pattern not found — "
+                        "ComfyUI version may have changed; leaving file unchanged"
+                    )
+        except Exception as _patch_err2:
+            log.warning(f"model_management.py: H3_TASK216b patcher failed: {_patch_err2}")
+
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
