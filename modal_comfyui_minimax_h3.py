@@ -554,6 +554,103 @@ class H3Generator:
         except Exception as _patch_err2:
             log.warning(f"model_management.py: H3_TASK216b patcher failed: {_patch_err2}")
 
+        # ------------------------------------------------------------------
+        # Task #216c (2026-09-13): fundamental fix — monkey-patch torch.cuda
+        # at module top of comfy/model_management.py so ALL current and
+        # future torch.cuda.* call sites in this module become tolerant.
+        # Whack-a-mole line patching (Tasks #216, #216b) is incomplete —
+        # Probe D2 found a THIRD eager CUDA-init site at model_management.py
+        # line 1973 in should_use_bf16 (calls torch.cuda.get_device_properties
+        # at UNETLoader load time, AFTER patches above fired). Task #216d,
+        # #216e would be inevitable if we kept patching line-by-line.
+        #
+        # Fix: inject a monkey-patch block right after `from __future__ import
+        # annotations` that wraps torch.cuda.get_device_properties() and
+        # torch.cuda.current_device() in try/except RuntimeError → safe
+        # defaults. FakeProps returns plausible H100-like values
+        # (major=9, total_memory=80GB) so subsequent dtype selection logic
+        # doesn't go down pathological branches.
+        #
+        # Namespacing: all injected names use _h3_* prefix to avoid collision
+        # with any existing names in model_management.py.
+        #
+        # Idempotent: sentinel H3_TASK216c_torch_cuda_tolerance.
+        # ------------------------------------------------------------------
+        _SENTINEL_3 = "# H3_TASK216c_torch_cuda_tolerance"
+        try:
+            _mm_src = _mm_path.read_text()
+            if _SENTINEL_3 in _mm_src:
+                log.info("model_management.py: H3_TASK216c patch already applied — skipping")
+            else:
+                # Anchor: first `from __future__ import annotations` line.
+                # Falls back to first `import psutil` if upstream changes
+                # the __future__ import. Either anchor is BEFORE any
+                # torch.cuda.* call in the file (lines 212+).
+                _anchor_pattern = re.compile(
+                    r"^(from __future__ import annotations|import psutil)\s*$",
+                    re.MULTILINE,
+                )
+                _m3 = _anchor_pattern.search(_mm_src)
+                if _m3:
+                    _inject_pos = _m3.end()
+                    # Inject a blank line + monkey-patch block. Indentation
+                    # is intentionally 0 (top-level module code).
+                    _injection = (
+                        "\n"
+                        "\n"
+                        "# H3_TASK216c_torch_cuda_tolerance — DO NOT REMOVE\n"
+                        "# Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        "# After snap-restore, torch.cuda.* can raise RuntimeError(\"No CUDA GPUs ...\").\n"
+                        "# Monkey-patch torch.cuda.get_device_properties and torch.cuda.current_device\n"
+                        "# to return safe defaults on RuntimeError. Single point of tolerance —\n"
+                        "# covers all current AND future call sites in model_management.py\n"
+                        "# (Tasks #216d/#216e no longer needed).\n"
+                        "try:\n"
+                        "    import torch as _h3_torch_216c\n"
+                        "    _h3_cuda_warned_216c = [False]\n"
+                        "    def _h3_cuda_log_216c():\n"
+                        "        if not _h3_cuda_warned_216c[0]:\n"
+                        "            import logging as _logging\n"
+                        "            _logging.warning(\n"
+                        "                \"[H3_TASK216c] torch.cuda tolerance active \"\n"
+                        "                \"(snap-restore GPU race — safe defaults returned)\"\n"
+                        "            )\n"
+                        "            _h3_cuda_warned_216c[0] = True\n"
+                        "    _h3_orig_get_dev_props_216c = _h3_torch_216c.cuda.get_device_properties\n"
+                        "    def _h3_safe_get_dev_props_216c(device):\n"
+                        "        try:\n"
+                        "            return _h3_orig_get_dev_props_216c(device)\n"
+                        "        except RuntimeError:\n"
+                        "            _h3_cuda_log_216c()\n"
+                        "            class _FakeProps:\n"
+                        "                major = 9\n"
+                        "                minor = 0\n"
+                        "                multi_processor_count = 132\n"
+                        "                total_memory = 80 * 1024 * 1024 * 1024\n"
+                        "            return _FakeProps()\n"
+                        "    _h3_torch_216c.cuda.get_device_properties = _h3_safe_get_dev_props_216c\n"
+                        "    _h3_orig_cur_dev_216c = _h3_torch_216c.cuda.current_device\n"
+                        "    def _h3_safe_cur_dev_216c():\n"
+                        "        try:\n"
+                        "            return _h3_orig_cur_dev_216c()\n"
+                        "        except RuntimeError:\n"
+                        "            _h3_cuda_log_216c()\n"
+                        "            return 0\n"
+                        "    _h3_torch_216c.cuda.current_device = _h3_safe_cur_dev_216c\n"
+                        "except Exception:\n"
+                        "    pass\n"
+                    )
+                    _new_src = _mm_src[:_inject_pos] + _injection + _mm_src[_inject_pos:]
+                    _mm_path.write_text(_new_src)
+                    log.info("model_management.py: applied H3_TASK216c torch.cuda tolerance patch")
+                else:
+                    log.warning(
+                        "model_management.py: H3_TASK216c anchor (from __future__ import annotations | "
+                        "import psutil) not found — ComfyUI version may have changed; leaving file unchanged"
+                    )
+        except Exception as _patch_err3:
+            log.warning(f"model_management.py: H3_TASK216c patcher failed: {_patch_err3}")
+
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
