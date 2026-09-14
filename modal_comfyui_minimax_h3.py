@@ -56,31 +56,24 @@ h3_models_volume = modal.Volume.from_name(
 # 307-redirects at 150s AFTER the function has already entered on the GPU
 # container (verified empirically 2026-09-05).
 # =============================================================================
-jobs = modal.Dict.from_name("h3-job-state", create_if_missing=True)
-
-# R.119: STALE_THRESHOLD env-override path.
-# PERMANENT DEBUG KNOB — default = function timeout (900) + transport buffer
-# (60). Mechanism is fully inert unless STALE_THRESHOLD_OVERRIDE is explicitly
-# set at deploy time. Captured into a Modal Secret (Modal does NOT auto-
-# propagate non-MODAL_* env vars to containers — see r119-handoff.md and
-# r119-mf-shipped-verified-2026-09-05.md for the gotcha).
-#
-# Usage for staleness-recovery testing:
-#   STALE_THRESHOLD_OVERRIDE=20 modal deploy modal_comfyui_minimax_h3.py
-#
-# This bakes a 20s threshold into the deployed function bytecode, letting the
-# staleness-recovery branch be exercised in ~25s instead of waiting 16 min.
-# After testing, deploy without the env var to restore default=960. Verified
-# 2026-09-05: prod deploy (no env var) behaves with default 960.
+# Task #218 (2026-09-13): DROP modal.Dict "jobs" — replaced by Modal-native
+# FunctionCall.from_id(call_id).get(timeout=0) for async result retrieval.
+# Why switch away from Dict (full RCA: research-modal-webhook-api-2026-09-13.md
+# + proposal-fix-modal-303-cold-start-2026-09-13.md):
+#   1. Dict eventual-consistency on container scaledown causes poll-7
+#      "not_found" misclassification (4 incidents: adb39bb8, e36f6c07,
+#      27d31af5, 24936235 — see task23 cluster).
+#   2. The 150s gateway 303 transport break CANNOT be patched at the Dict
+#      layer — only .spawn() (returns immediately, no blocking request thread)
+#      bypasses the cold-start window entirely.
+# FunctionCall is the community-blessed pattern per Modal docs:
+#   https://modal.com/docs/guide/webhook-timeouts (see .spawn() section)
+#   https://modal.com/docs/guide/trigger-deployed-functions (FunctionCall.from_id)
+# Idempotency: worker keeps `call_id` for the lifetime of the job. If a
+# worker retry happens, it re-polls the SAME call_id (not a new spawn), so
+# concurrent submits with the same nonce are the WORKER's responsibility, not
+# Modal's. Task #163 already added this dedup.
 _R119_SECRETS = []
-if os.environ.get("STALE_THRESHOLD_OVERRIDE"):
-    _R119_SECRETS.append(
-        modal.Secret.from_dict(
-            {"STALE_THRESHOLD_OVERRIDE": os.environ["STALE_THRESHOLD_OVERRIDE"]}
-        )
-    )
-
-STALE_THRESHOLD = int(os.environ.get("STALE_THRESHOLD_OVERRIDE", "960"))
 
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
@@ -274,57 +267,38 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 
 
 # =============================================================================
-# Inference: ASGI app proxying to local ComfyUI (cloned from modal_comfyui.py)
+# Task #218 (2026-09-13): serve() /api/status endpoint DELETED — replaced by
+# Modal-native FunctionCall.from_id(call_id).get(timeout=0) pattern (Option A
+# per Modal docs). The serve() function existed to host a Dict-based status
+# poll endpoint for worker polling, but that architecture had two failure modes:
+#   1. Cold-start 303 transport break (150s gateway limit)
+#   2. Dict eventual-consistency on container scaledown
+# Both are eliminated by switching api_run to .spawn() and adding api_result
+# below (H3Generator class method).
+# Worker's MODAL_STATUS_URL env var now points to H3Generator's api_result URL
+# (auto-named by Modal as `<app>-<class>-<method>.modal.run`). Same env var
+# name retained for back-compat; URL pattern changes from `/?nonce=` to
+# `/?call_id=` (query-param style because @modal.fastapi_endpoint does NOT
+# support path args — see [[modal-fastapi-endpoint-no-path-arg-2026-09-10]]).
 # =============================================================================
-@app.function(
-    image=image,
-    secrets=_R119_SECRETS,
-    cpu=1,
-    memory=256,
-    timeout=30,
-    enable_memory_snapshot=True,    # Task #135: snapshot restore ~8s vs full cold ~30-60s
-    min_containers=0,
-    scaledown_window=60,
-)
-@modal.fastapi_endpoint(method="GET")
-def api_status_endpoint(nonce: str) -> dict:
-    """GET /?nonce={nonce} — status-only polling endpoint (NOT /api/status/{nonce}).
-
-    URL pattern is `/?nonce={nonce}` because @modal.fastapi_endpoint() does not
-    support custom path prefixes (no `path=` argument in decorator signature —
-    verified 2026-09-10). Function args default to QUERY PARAMS via FastAPI.
-    Worker uses `${MODAL_STATUS_URL}/?nonce=${encodeURIComponent(nonce)}`.
-    See MEMORY [[modal-fastapi-endpoint-no-path-arg-2026-09-10]] for full analysis.
-    """
-    result = jobs.get(nonce)
-    if result is None:
-        return {"status": "not_found"}
-    # Strip raw video bytes — FastAPI jsonable_encoder fails on bytes (H.264 0xc3).
-    # Worker only needs status/error from this endpoint; bytes flow through
-    # /api/run (initial submit OR generate() idempotent re-POST).
-    result.pop("result", None)
-    return result
 
 
 # =============================================================================
-# R.119 (2026-09-05): H3Generator — direct method-based invocation, no HTTP
-# roundtrip. Returns video bytes directly so worker never touches /api/view
-# (which serves from ComfyUI's in-memory OUTPUTS_MAP and 404s after scaledown).
+# R.119 (2026-09-05) + Task #218 (2026-09-13): H3Generator — direct method-based
+# invocation, no HTTP roundtrip. Returns video bytes directly so worker never
+# touches /api/view (which serves from ComfyUI's in-memory OUTPUTS_MAP and
+# 404s after scaledown).
 #
-# Idempotency model (v3):
-#   1. Atomic claim via jobs.put(nonce, {status:running}, skip_if_exists=True).
-#      Returns True if we got the slot; False if nonce already existed.
-#   2. If we lost the race, inspect existing status:
-#        - done    → return cached result (idempotent retry)
-#        - failed  → raise PREVIOUS_ATTEMPT_FAILED (worker surfaces to user)
-#        - running → check staleness; if age < STALE_THRESHOLD raise DUPLICATE
-#                    so worker backs off; if age >= STALE_THRESHOLD, reclaim
-#                    (original container must have died hard — OOM, kill, etc.)
-#   3. Run workflow via local ComfyUI on :8188 (same container, no HTTP proxy).
-#   4. Explicit volume.commit() before returning bytes — replaces R.137 watcher.
-#
-# Why STALE_THRESHOLD = 960: function timeout is 900s + 60s transport buffer.
-# Any "running" entry older than that means the original job is dead.
+# Idempotency model (v4 — Task #218 / Option A):
+#   R.119 v1-v3 used modal.Dict("jobs") for nonce-keyed atomic claim +
+#   result caching. REPLACED by Modal-native FunctionCall.from_id pattern.
+#   Worker keeps `call_id` from spawn response; retries by re-polling
+#   same call_id (not re-spawning). Concurrent submits with same nonce are
+#   the WORKER's responsibility, not Modal's (Task #163 already added this).
+#   See [[modal-fastapi-endpoint-no-path-arg-2026-09-10]] for URL pattern.
+# Flow:
+#   1. Run workflow via local ComfyUI on :8188 (same container, no HTTP proxy).
+#   2. Explicit volume.commit() before returning bytes — replaces R.137 watcher.
 # =============================================================================
 @app.cls(
     image=image,
@@ -414,8 +388,17 @@ class H3Generator:
             os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
 
         log.info("Sync model copy (~50 GB / ~3 min)")
+        # ponytail: cold-start RCA — verify whether copy loop re-runs inside setup()
+        # despite @modal.enter(snap=True). Snapshots capture FS state from this point,
+        # so the loop SHOULD be skipped on warm starts. If INSTR_COPY END appears on
+        # warm starts, copy is being re-executed (bottleneck confirmed).
+        copy_start_ts = time.monotonic()
+        copy_start_wall = time.time()
+        log.info(f"[INSTR_COPY] model copy START wall={copy_start_wall:.3f} monotonic={copy_start_ts:.3f}")
         for sub in all_subs:
             copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        copy_duration = time.monotonic() - copy_start_ts
+        log.info(f"[INSTR_COPY] model copy END wall={time.time():.3f} duration={copy_duration:.1f}s")
         log.info("Model copy complete")
 
         # Persist output to Modal Volume
@@ -440,10 +423,22 @@ class H3Generator:
         # crashes BEFORE its HTTP server starts → setup()'s /system_stats
         # poll loops 600× → RuntimeError("ComfyUI startup timeout").
         #
-        # Fix: wrap the eager init in try/except RuntimeError. On failure,
-        # `total_vram = 0`. On Linux (Modal runs Linux), `total_vram` is only
-        # read in a Windows-only VRAM-reservation branch; the only Linux
-        # effect is a slightly different startup log line.
+        # Fix: wrap the eager init in try/except (RuntimeError, KeyError,
+        # TypeError, AttributeError). On failure, `total_vram = 0`. On
+        # Linux (Modal runs Linux), `total_vram` is only read in a
+        # Windows-only VRAM-reservation branch; the only Linux effect is a
+        # slightly different startup log line.
+        #
+        # Task #216d (2026-09-14): broadened from `except RuntimeError` to
+        # `except (RuntimeError, KeyError, TypeError, AttributeError)`. The
+        # original wrap at this consumer site missed KeyError raised
+        # INSIDE `get_total_memory` at line ~403 on
+        # `stats['reserved_bytes.all.current']` when GPU telemetry dict is
+        # missing fields during cold-start snap-restore (Modal app
+        # `comfyui-minimax-h3` crashlooping since v48 / 2026-09-13 10:24,
+        # last known-good v47 = `4ef858e`). TypeError/AttributeError also
+        # covered defensively for adjacent dict-access failures
+        # (None stats, stale device handle, etc.).
         #
         # Idempotent: sentinel comment check skips re-runs. Re-runs on a
         # new ComfyUI version that preserves the line shape will re-patch
@@ -468,15 +463,20 @@ class H3Generator:
                         f"{_indent}# H3_TASK216_PATCH: deferred_cuda_init\n"
                         f"{_indent}try:\n"
                         f"{_indent}    total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)\n"
-                        f"{_indent}except RuntimeError as _e3_init_err:\n"
+                        f"{_indent}except (RuntimeError, KeyError, TypeError, AttributeError) as _e3_init_err:\n"
                         f"{_indent}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
                         f"{_indent}    # First import post-restore can race the GPU bind. Defer to 0;\n"
                         f"{_indent}    # total_vram is only read in Windows-only VRAM-reservation logic,\n"
                         f"{_indent}    # so on Linux this only affects the startup log line.\n"
+                        f"{_indent}    # Task #216d (2026-09-14): broadened except tuple — get_total_memory\n"
+                        f"{_indent}    # at line ~403 crashes with KeyError on stats['reserved_bytes.all.current']\n"
+                        f"{_indent}    # when GPU telemetry dict is missing fields during cold-start snap-restore.\n"
+                        f"{_indent}    # TypeError/AttributeError also covered defensively for adjacent dict-access\n"
+                        f"{_indent}    # failures (None stats, stale device handle, etc.).\n"
                         f"{_indent}    total_vram = 0\n"
                         f"{_indent}    logging.warning(\n"
-                        f"{_indent}        \"H3_TASK216: deferred CUDA init in comfy.model_management: %s\",\n"
-                        f"{_indent}        _e3_init_err,\n"
+                        f"{_indent}        \"H3_TASK216d: deferred init in comfy.model_management caught %s: %s\",\n"
+                        f"{_indent}        type(_e3_init_err).__name__, _e3_init_err,\n"
                         f"{_indent}    )"
                     )
                     _new_src = _mm_src[:_m.start()] + _replacement + _mm_src[_m.end():]
@@ -627,6 +627,15 @@ class H3Generator:
                         "                minor = 0\n"
                         "                multi_processor_count = 132\n"
                         "                total_memory = 80 * 1024 * 1024 * 1024\n"
+                        "                # H3_TASK216e — .name added so torch.cuda.get_device_name()\n"
+                        "                # (which calls get_device_properties(device).name) stops\n"
+                        "                # crashing on snap-restore cold-start at\n"
+                        "                # comfy/model_management.py:685 cuda_malloc_warning().\n"
+                        "                # Defensive siblings for likely-next-access sites.\n"
+                        "                name = \"NVIDIA H100-SXM5-80GB\"\n"
+                        "                is_integrated = 0\n"
+                        "                is_multi_gpu_board = 0\n"
+                        "                L2_cache_size = 50 * 1024 * 1024  # 50 MB\n"
                         "            return _FakeProps()\n"
                         "    _h3_torch_216c.cuda.get_device_properties = _h3_safe_get_dev_props_216c\n"
                         "    _h3_orig_cur_dev_216c = _h3_torch_216c.cuda.current_device\n"
@@ -692,99 +701,50 @@ class H3Generator:
 
     @modal.method()
     def generate(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
-        """R.119 — entry point for /api/run. Returns video bytes.
+        """R.119 + Task #218 — entry point invoked via .spawn() from api_run.
 
-        Idempotency (v3): atomic claim via jobs.put(skip_if_exists=True).
-        Staleness recovery: if existing.status=='running' and age>=STALE_THRESHOLD,
-        reclaim the slot (original container died hard — OOM/kill/SIGKILL).
+        Returns video bytes. Result is captured by Modal's FunctionCall
+        infrastructure and made available via FunctionCall.from_id(call_id)
+        in the api_result endpoint. Worker polls api_result with the
+        call_id from the spawn response.
+
+        Idempotency note: R.119 used modal.Dict for nonce-keyed atomic claim
+        + result caching. Task #218 removes Dict entirely — concurrent submits
+        with the same nonce are the WORKER's responsibility (worker keeps
+        call_id, retries by re-polling same call_id rather than re-spawning;
+        see Task #163 worker-side dedup). Modal FunctionCall itself is
+        idempotent on (call_id) — multiple polls of the same call_id return
+        the same result once available.
         """
-        # 1. ATOMIC CLAIM — Modal Dict put with skip_if_exists returns
-        #    True if we wrote, False if the key already existed.
-        claim = jobs.put(
-            nonce,
-            {"status": "running", "started_at": time.time(),
-             "container": os.environ.get("MODAL_TASK_ID", "unknown")},
-            skip_if_exists=True,
-        )
-        if not claim:
-            existing = jobs.get(nonce)
-            if existing is None:
-                # Race: someone deleted between put and get. Retry claim.
-                claim = jobs.put(
-                    nonce,
-                    {"status": "running", "started_at": time.time()},
-                    skip_if_exists=True,
-                )
-                if not claim:
-                    existing = jobs.get(nonce) or {}
-                else:
-                    existing = {"status": "running", "started_at": time.time()}
-
-            if existing.get("status") == "done":
-                log.info(f"generate nonce={nonce}: idempotent hit, returning cached result ({len(existing.get('result', b''))} bytes)")
-                return existing["result"]
-            if existing.get("status") == "failed":
-                # Don't auto-retry — surface the previous error to the worker.
-                raise Exception(
-                    f"PREVIOUS_ATTEMPT_FAILED: {existing.get('error', 'unknown')}"
-                )
-            # status == "running" — check staleness
-            age = time.time() - existing.get("started_at", time.time())
-            if age < STALE_THRESHOLD:
-                raise Exception(
-                    f"DUPLICATE: nonce {nonce} still running (age={age:.0f}s)"
-                )
-            # Stale — original container died without writing status. Reclaim.
-            log.warning(
-                f"generate nonce={nonce}: stale running (age={age:.0f}s >= "
-                f"{STALE_THRESHOLD}), reclaiming"
-            )
-            jobs.put(
-                nonce,
-                {"status": "running", "started_at": time.time(),
-                 "container": os.environ.get("MODAL_TASK_ID", "reclaim")},
-                skip_if_exists=False,
-            )
-
-        # 2. RUN WORKFLOW via local ComfyUI on :8188 (same container).
+        log.info(f"generate nonce={nonce}: starting (call_id-based)")
         t0 = time.time()
-        try:
-            result_bytes = self._run_workflow(workflow_json, image_b64, nonce)
-            elapsed = time.time() - t0
-            jobs.put(
-                nonce,
-                {"status": "done", "result": result_bytes,
-                 "finished_at": time.time(), "elapsed": elapsed},
-                skip_if_exists=False,
-            )
-            log.info(
-                f"generate nonce={nonce}: DONE in {elapsed:.1f}s "
-                f"({len(result_bytes)} bytes)"
-            )
-            return result_bytes
-        except Exception as e:
-            elapsed = time.time() - t0
-            err = str(e)[:500]
-            jobs.put(
-                nonce,
-                {"status": "failed", "error": err,
-                 "failed_at": time.time(), "elapsed": elapsed},
-                skip_if_exists=False,
-            )
-            log.exception(f"generate nonce={nonce}: FAILED after {elapsed:.1f}s: {err}")
-            raise
+        result_bytes = self._run_workflow(workflow_json, image_b64, nonce)
+        elapsed = time.time() - t0
+        log.info(
+            f"generate nonce={nonce}: DONE in {elapsed:.1f}s "
+            f"({len(result_bytes)} bytes)"
+        )
+        return result_bytes
 
     @modal.fastapi_endpoint(method="POST")
     def api_run(self, payload: dict) -> dict:
-        """Task #91 (2026-09-12): consolidate serve() ASGI into H3Generator.
+        """Task #91 (2026-09-12) + Task #218 (2026-09-13): spawn-and-return.
 
-        Replaces the old @modal.asgi_app serve() function with an
-        @modal.fastapi_endpoint on the class itself. Two wins:
-          - ONE container (H3Generator's) per generation instead of two
-            (serve() had its own @app.function cold-start separate from
-            H3Generator's). Saves ~30-60s of serve() cold-start.
-          - enable_memory_snapshot works here (asgi_app() never did —
-            documented Modal restriction).
+        Spawns H3Generator.generate() via .spawn() — Modal returns IMMEDIATELY
+        with a FunctionCall handle. Worker polls api_result with the returned
+        call_id to retrieve the result.
+
+        Why .spawn() instead of .local() (the previous Task #91 behavior):
+          - .local() blocks the request thread until generate() returns —
+            gates us on the 150s Modal gateway transport break. Cold-start
+            can be >300s; any /api/run POST after that window hits a 303
+            redirect with no result payload. Worker falls back to polling,
+            which works but adds latency.
+          - .spawn() returns the FunctionCall handle in <1s. The request
+            thread is freed immediately. Generate runs to completion
+            server-side, result captured by Modal's FunctionCall infra.
+            Worker polls api_result with call_id — no 303 risk, no
+            thread-blocking, no cold-start window coupling.
 
         URL: Modal auto-names this as <app>-<class>-<method>.modal.run:
             https://anton722451--comfyui-minimax-h3-h3generator-api-run.modal.run
@@ -795,8 +755,8 @@ class H3Generator:
         (NOT `request: Request`). Modal/FastAPI introspects the signature and
         sees `dict` → treats the JSON body as the dict. With `Request` in the
         signature, FastAPI treats `request` as a query parameter (returns 422).
-        sync `def` is fine here: payload parsing is automatic; the heavy work
-        (generate.local) is sync; .local() blocks this thread, not an event loop.
+        sync `def` is fine here: payload parsing is automatic; .spawn() is
+        non-blocking (returns immediately with FunctionCall handle).
         """
         from fastapi import HTTPException
 
@@ -829,29 +789,103 @@ class H3Generator:
         if not workflow_json:
             raise HTTPException(status_code=400, detail="missing workflow")
 
-        log.info(f"api_run nonce={nonce} workflow_keys={list(workflow_json.keys())[:3] if isinstance(workflow_json, dict) else type(workflow_json).__name__}")
+        log.info(f"api_run nonce={nonce} spawning workflow")
 
-        # Task #91: .local() (NOT .remote()) — Modal SDK descriptor protocol:
-        # @modal.method() decorated methods must be invoked via .local() or .remote().
-        # Since we're inside the class's own container, .local() is the canonical
-        # pattern (no network hop, no separate cold-start).
+        # Task #218: .spawn() (NOT .local()) — Modal SDK descriptor protocol.
+        # .spawn() returns immediately with a FunctionCall handle. The heavy
+        # work happens server-side; we don't block this request thread. The
+        # 150s gateway transport break CANNOT fire because we return in <1s.
+        try:
+            call = self.generate.spawn(workflow_json, image_b64, nonce)
+        except Exception as e:
+            log.exception(f"api_run nonce={nonce} spawn failed")
+            raise HTTPException(status_code=500, detail=f"spawn_failed: {str(e)[:500]}")
+
+        log.info(f"api_run nonce={nonce} spawned call_id={call.object_id}")
+        return {
+            "status": "queued",
+            "nonce": nonce,
+            "call_id": call.object_id,
+        }
+
+    @modal.fastapi_endpoint(method="GET")
+    def api_result(self, call_id: str) -> dict:
+        """Task #218 (2026-09-13): poll call result via FunctionCall.from_id.
+
+        URL: Modal auto-names this as <app>-<class>-<method>.modal.run.
+        Worker hits `${MODAL_RESULT_URL}/?call_id={call_id}` (query-param
+        style because @modal.fastapi_endpoint does NOT support path args —
+        see [[modal-fastapi-endpoint-no-path-arg-2026-09-10]]).
+
+        Returns (FastAPI JSON):
+          200 + {video_b64, elapsed_s, size_bytes, call_id, status: "done"}
+                — generate() completed successfully
+          202 + {status: "running"} — call exists but generate() not done yet
+          404 + {error: "call_not_found"} — call_id unknown or expired (Modal
+                FunctionCall state is bounded; default ttl ~hours)
+          500 + {error, detail} — generate() raised an exception; surface
+                the message so worker can classify (REMOTE_FAILED, etc.)
+
+        Implements Option A per Modal docs (community-blessed pattern for
+        async result retrieval):
+          https://modal.com/docs/guide/webhook-timeouts (see .spawn() section)
+          https://modal.com/docs/guide/trigger-deployed-functions
+        """
+        import base64 as _b64
+        from fastapi.responses import JSONResponse
+
         t0 = time.time()
         try:
-            result_bytes = self.generate.local(workflow_json, image_b64, nonce)
+            function_call = modal.FunctionCall.from_id(call_id)
+        except modal.exception.NotFoundError:
+            log.warning(f"api_result call_id={call_id}: not_found")
+            return JSONResponse(
+                {"error": "call_not_found", "call_id": call_id},
+                status_code=404,
+            )
         except Exception as e:
-            elapsed = time.time() - t0
-            log.exception(f"api_run nonce={nonce} failed after {elapsed:.1f}s")
-            # Surface the exception message — worker uses it for idempotency
-            # decision-making (DUPLICATE / PREVIOUS_ATTEMPT_FAILED / etc.).
-            raise HTTPException(status_code=500, detail=str(e)[:1000])
+            log.exception(f"api_result call_id={call_id}: from_id failed")
+            return JSONResponse(
+                {"error": "from_id_failed", "detail": str(e)[:500]},
+                status_code=500,
+            )
+
+        try:
+            # Non-blocking poll — raises TimeoutError immediately if not done.
+            # Modal internal state — no Dict eventual-consistency window
+            # (Task #218 / Option A).
+            result_bytes = function_call.get(timeout=0)
+        except TimeoutError:
+            return JSONResponse(
+                {"status": "running", "call_id": call_id},
+                status_code=202,
+            )
+        except modal.exception.NotFoundError:
+            log.warning(f"api_result call_id={call_id}: expired between from_id and get")
+            return JSONResponse(
+                {"error": "call_not_found", "call_id": call_id},
+                status_code=404,
+            )
+        except Exception as e:
+            # generate() raised — Modal wraps the exception inside FunctionCall.get().
+            # Surface the message; worker classifies via WorkerRemoteError.
+            err_str = str(e)
+            log.exception(f"api_result call_id={call_id}: generation failed: {err_str[:200]}")
+            return JSONResponse(
+                {"error": "generation_failed", "detail": err_str[:500], "call_id": call_id},
+                status_code=500,
+            )
+
+        # Success — encode bytes to base64 (FastAPI jsonable_encoder fails on bytes,
+        # same H.264 0xc3 issue that bit /api/status pre-fix). Worker consumes the
+        # JSON envelope identically to Task #91's bytes-in-handler path.
         elapsed = time.time() - t0
-        log.info(f"api_run nonce={nonce} returned {len(result_bytes)} bytes after {elapsed:.1f}s")
-        import base64 as _b64
         return {
+            "status": "done",
             "video_b64": _b64.b64encode(result_bytes).decode("ascii"),
             "elapsed_s": round(elapsed, 2),
             "size_bytes": len(result_bytes),
-            "nonce": nonce,
+            "call_id": call_id,
         }
 
     def _run_workflow(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
@@ -999,48 +1033,21 @@ class H3Generator:
 
         return video_bytes
 
-
 # =============================================================================
-# ⚠️ DEAD CODE (Task #130, 2026-09-09, commit 5c92411) — REFERENCE ONLY.
+# DEAD CODE removed (Task #218 / Option A, 2026-09-13):
+#   - `check_job_status(nonce)` — formerly R.119 cold-start-free status reader via
+#     Modal Dict. Killed by Task #130 (2026-09-09) when /api/status inlined
+#     jobs.get(); now doubly dead because Option A eliminates the Dict entirely
+#     and replaces status with `FunctionCall.from_id(call_id).get(timeout=0)`.
+#   - `jobs = modal.Dict.from_name(...)` removed at top of file — see header comment.
 #
-# History:
-#   R.119 (2026-09-05): Originally used by worker on retry to check job state
-#   WITHOUT spinning up a GPU container (which would just throw DUPLICATE and
-#   burn money). Reads the same Modal Dict as H3Generator.
-#   Task #130 (2026-09-09): The /api/status/{nonce} endpoint in serve() above
-#   (lines 614-676) inlines `jobs.get()` via `asyncio.to_thread()`, eliminating
-#   the `.remote(check_job_status)` chain that triggered a SEPARATE CPU
-#   function cold-start (10-30s, no enable_memory_snapshot) on top of
-#   serve()'s own cold-start = 76.1s Modal duration for a 2.88s Dict read
-#   (Task #39 trigger #2 gen 8d7f7464 observation). This function is no
-#   longer called.
+# If you ever need status without result payload, use:
+#   call = FunctionCall.from_id(call_id)
+#   try:
+#       _ = call.get(timeout=0)   # 202 "running" or raises TimeoutError
+#   except TimeoutError:
+#       return {"status": "running", "call_id": call_id}
 #
-# DO NOT wire back up without porting the strip-result pattern below
-# (line 1105) to the new caller. /api/status can't include the `result` key
-# because FastAPI's jsonable_encoder calls bytes.decode() and raises
-# UnicodeDecodeError on H.264 byte 0xc3. The Dict keeps `result` so
-# generate()'s idempotent branch (line ~894) can return cached bytes via
-# /api/run defensive re-POST (modal-comfyui.provider.ts fetchCachedBytes).
-#
-# Active fix: api_status() above at lines 661-663.
-# See MEMORY [[modal-api-status-cold-start-chain-fix-2026-09-09]] +
-# [[reelant-worker-stuck-queue-pre-existing-2026-09-09]].
-# Safe to delete this block in a follow-up commit once Task #130 is verified
-# stable in prod for several days.
-# =============================================================================
-@app.function(cpu=1, memory=256, timeout=30)
-def check_job_status(nonce: str) -> dict:
-    existing = jobs.get(nonce)
-    if existing is None:
-        return {"status": "not_found"}
-    # Strip the video bytes — /api/status must return JSON only, and 378KB of
-    # H.264 bytes can't be UTF-8 decoded by FastAPI's JSON encoder. The worker
-    # uses this endpoint only to detect "done" / "failed" / "running" state, not
-    # to fetch the result. (See outdated-comment notice above.)
-    slim = {k: v for k, v in existing.items() if k != "result"}
-    return slim
-
-
 # =============================================================================
 # Pre-warm: REMOVED 2026-08-31 (replaced by Modal-native autoscaler above).
 # See B3 → B0 migration notes in MEMORY.
