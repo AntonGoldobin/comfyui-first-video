@@ -414,10 +414,22 @@ class H3Generator:
         # crashes BEFORE its HTTP server starts → setup()'s /system_stats
         # poll loops 600× → RuntimeError("ComfyUI startup timeout").
         #
-        # Fix: wrap the eager init in try/except RuntimeError. On failure,
-        # `total_vram = 0`. On Linux (Modal runs Linux), `total_vram` is only
-        # read in a Windows-only VRAM-reservation branch; the only Linux
-        # effect is a slightly different startup log line.
+        # Fix: wrap the eager init in try/except (RuntimeError, KeyError,
+        # TypeError, AttributeError). On failure, `total_vram = 0`. On
+        # Linux (Modal runs Linux), `total_vram` is only read in a
+        # Windows-only VRAM-reservation branch; the only Linux effect is a
+        # slightly different startup log line.
+        #
+        # Task #216d (2026-09-14): broadened from `except RuntimeError` to
+        # `except (RuntimeError, KeyError, TypeError, AttributeError)`. The
+        # original wrap at this consumer site missed KeyError raised
+        # INSIDE `get_total_memory` at line ~403 on
+        # `stats['reserved_bytes.all.current']` when GPU telemetry dict is
+        # missing fields during cold-start snap-restore (Modal app
+        # `comfyui-minimax-h3` crashlooping since v48 / 2026-09-13 10:24,
+        # last known-good v47 = `4ef858e`). TypeError/AttributeError also
+        # covered defensively for adjacent dict-access failures
+        # (None stats, stale device handle, etc.).
         #
         # Idempotent: sentinel comment check skips re-runs. Re-runs on a
         # new ComfyUI version that preserves the line shape will re-patch
@@ -442,15 +454,20 @@ class H3Generator:
                         f"{_indent}# H3_TASK216_PATCH: deferred_cuda_init\n"
                         f"{_indent}try:\n"
                         f"{_indent}    total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)\n"
-                        f"{_indent}except RuntimeError as _e3_init_err:\n"
+                        f"{_indent}except (RuntimeError, KeyError, TypeError, AttributeError) as _e3_init_err:\n"
                         f"{_indent}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
                         f"{_indent}    # First import post-restore can race the GPU bind. Defer to 0;\n"
                         f"{_indent}    # total_vram is only read in Windows-only VRAM-reservation logic,\n"
                         f"{_indent}    # so on Linux this only affects the startup log line.\n"
+                        f"{_indent}    # Task #216d (2026-09-14): broadened except tuple — get_total_memory\n"
+                        f"{_indent}    # at line ~403 crashes with KeyError on stats['reserved_bytes.all.current']\n"
+                        f"{_indent}    # when GPU telemetry dict is missing fields during cold-start snap-restore.\n"
+                        f"{_indent}    # TypeError/AttributeError also covered defensively for adjacent dict-access\n"
+                        f"{_indent}    # failures (None stats, stale device handle, etc.).\n"
                         f"{_indent}    total_vram = 0\n"
                         f"{_indent}    logging.warning(\n"
-                        f"{_indent}        \"H3_TASK216: deferred CUDA init in comfy.model_management: %s\",\n"
-                        f"{_indent}        _e3_init_err,\n"
+                        f"{_indent}        \"H3_TASK216d: deferred init in comfy.model_management caught %s: %s\",\n"
+                        f"{_indent}        type(_e3_init_err).__name__, _e3_init_err,\n"
                         f"{_indent}    )"
                     )
                     _new_src = _mm_src[:_m.start()] + _replacement + _mm_src[_m.end():]
