@@ -388,8 +388,17 @@ class H3Generator:
             os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
 
         log.info("Sync model copy (~50 GB / ~3 min)")
+        # ponytail: cold-start RCA — verify whether copy loop re-runs inside setup()
+        # despite @modal.enter(snap=True). Snapshots capture FS state from this point,
+        # so the loop SHOULD be skipped on warm starts. If INSTR_COPY END appears on
+        # warm starts, copy is being re-executed (bottleneck confirmed).
+        copy_start_ts = time.monotonic()
+        copy_start_wall = time.time()
+        log.info(f"[INSTR_COPY] model copy START wall={copy_start_wall:.3f} monotonic={copy_start_ts:.3f}")
         for sub in all_subs:
             copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        copy_duration = time.monotonic() - copy_start_ts
+        log.info(f"[INSTR_COPY] model copy END wall={time.time():.3f} duration={copy_duration:.1f}s")
         log.info("Model copy complete")
 
         # Persist output to Modal Volume
