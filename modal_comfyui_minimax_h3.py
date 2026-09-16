@@ -10,7 +10,7 @@ Reuses the proven scaffold from modal_comfyui.py:
   - sombi base image (sombi/comfyui:base-torch2.8.0-cu124)
   - /ComfyUI mount, --output-directory /modal-data/output, ASGI proxy
   - copy_dir_contents from Modal Volume to /ComfyUI/models/
-  - same 600s startup, 1800s timeout, 5s scaledown_window (R.117, 2026-09-01)
+  - same 600s startup, 1800s timeout, 120s scaledown_window (R.117 5s, Task F 2026-09-16 → 120s)
 
 Differences from modal_comfyui.py:
   - app name: comfyui-minimax-h3
@@ -330,7 +330,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # MEMORY [[modal-snapshot-restore-never-happens-2026-09-16]].
     enable_memory_snapshot=False,
     min_containers=0,
-    scaledown_window=5,
+    scaledown_window=120,  # Task F (2026-09-16): was 5s, too aggressive — worker poll (30-60s) hit cold result-container every cycle. 120s keeps it warm through full gen+fetch cycle.
     max_containers=20,
     # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
     # MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
