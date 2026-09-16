@@ -306,7 +306,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 # container's threadpool until the GPU method returns (~minutes for a real
 # generation) — worker stalls on /api/result polling.
 # Modal Labs production-tested this combo on @modal.cls(enable_memory_snapshot=True)
-# + @modal.enter(snap=True) — see sglang_snapshot.py / ministral3_inference.py.
+# + @modal.enter() — see sglang_snapshot.py / ministral3_inference.py.
 # NOTE: decorator order matters — @app.cls OUTSIDE, @modal.concurrent INSIDE
 # (opposite of standard "wrap outside" intuition). Modal SDK raises
 # InvalidError("Cannot stack @modal.concurrent on top of @app.cls()") if
@@ -325,7 +325,8 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     # Restore-fail fallback adds ~8 min delay per cold-start before
     # Modal gives up and runs full setup(). Without snapshot: setup()
     # runs 27-81s every cold-start, no restore-fail delay.
-    # @modal.enter(snap=True) below is now a no-op (kept for clarity).
+    # @modal.enter() below is NOT decorated with snap=True — Modal SDK
+    # enforces snap=True requires enable_memory_snapshot=True.
     # MEMORY [[modal-snapshot-restore-never-happens-2026-09-16]].
     enable_memory_snapshot=False,
     min_containers=0,
@@ -343,7 +344,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 )
 @modal.concurrent(target_inputs=4, max_inputs=4)
 class H3Generator:
-    @modal.enter(snap=True)
+    @modal.enter()
     def setup(self):
         """Initialize GPU container once per cold start. Symlinks models,
         launches ComfyUI subprocess on :8188, waits for ready. Snapshotted."""
@@ -410,7 +411,7 @@ class H3Generator:
 
         log.info("Sync model copy (~50 GB / ~3 min)")
         # ponytail: cold-start RCA — verify whether copy loop re-runs inside setup()
-        # despite @modal.enter(snap=True). Snapshots capture FS state from this point,
+        # despite @modal.enter(). Snapshots capture FS state from this point,
         # so the loop SHOULD be skipped on warm starts. If INSTR_COPY END appears on
         # warm starts, copy is being re-executed (bottleneck confirmed).
         copy_start_ts = time.monotonic()
@@ -437,7 +438,7 @@ class H3Generator:
         # Root cause: `main.py:239` imports `comfy.model_management`, which at
         # module-load runs `total_vram = get_total_memory(get_torch_device())`.
         # `get_torch_device()` calls `torch.cuda.current_device()` →
-        # `torch._C._cuda_init()`. After a Modal @modal.enter(snap=True)
+        # `torch._C._cuda_init()`. After a Modal @modal.enter()
         # snapshot restore, GPU memory state is NOT in the snapshot (Modal
         # docs explicit). On the first import post-restore, the GPU may not
         # be bound yet → RuntimeError("No CUDA GPUs are available"). ComfyUI
@@ -485,7 +486,7 @@ class H3Generator:
                         f"{_indent}try:\n"
                         f"{_indent}    total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)\n"
                         f"{_indent}except (RuntimeError, KeyError, TypeError, AttributeError) as _e3_init_err:\n"
-                        f"{_indent}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        f"{_indent}    # Modal @modal.enter() snapshots CPU+FS but NOT GPU state.\n"
                         f"{_indent}    # First import post-restore can race the GPU bind. Defer to 0;\n"
                         f"{_indent}    # total_vram is only read in Windows-only VRAM-reservation logic,\n"
                         f"{_indent}    # so on Linux this only affects the startup log line.\n"
@@ -552,7 +553,7 @@ class H3Generator:
                         f"{_indent2}try:\n"
                         f"{_indent2}    return torch.device(torch.cuda.current_device())\n"
                         f"{_indent2}except RuntimeError as _e212_init_err:\n"
-                        f"{_indent2}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        f"{_indent2}    # Modal @modal.enter() snapshots CPU+FS but NOT GPU state.\n"
                         f"{_indent2}    # get_torch_device() is called at module load by cuda_malloc_warning(),\n"
                         f"{_indent2}    # BEFORE the previously-patched line 363 ever runs. Fall back to CPU\n"
                         f"{_indent2}    # so ComfyUI import succeeds and the HTTP server can start; the next\n"
@@ -620,7 +621,7 @@ class H3Generator:
                         "\n"
                         "\n"
                         "# H3_TASK216c_torch_cuda_tolerance — DO NOT REMOVE\n"
-                        "# Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        "# Modal @modal.enter() snapshots CPU+FS but NOT GPU state.\n"
                         "# After snap-restore, torch.cuda.* can raise RuntimeError(\"No CUDA GPUs ...\").\n"
                         "# Monkey-patch torch.cuda.get_device_properties and torch.cuda.current_device\n"
                         "# to return safe defaults on RuntimeError. Single point of tolerance —\n"
