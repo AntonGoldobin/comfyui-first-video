@@ -1,229 +1,233 @@
 {
-  "10": {
+  "121": {
+    "class_type": "VAEDecodeAudio",
     "inputs": {
-      "clip_name1": "ltx2.3/gemma3-12B-hereticx-sikaworld.safetensors",
-      "clip_name2": "ltx2.3/ltx-2.3_text_projection_bf16.safetensors",
-      "type": "ltxv",
-      "device": "default"
+      "samples": ["151", 0],
+      "vae": ["203", 0]
     },
-    "class_type": "DualCLIPLoader"
+    "_meta": {
+      "title": "VAE Decode Audio"
+    }
   },
-  "21": {
+  "122": {
+    "class_type": "VAEDecode",
     "inputs": {
-      "vae_name": "ltx2.3/LTX23_video_vae_bf16.safetensors"
+      "samples": ["151", 0],
+      "vae": ["202", 0]
     },
-    "class_type": "VAELoader"
+    "_meta": {
+      "title": "VAE Decode"
+    }
   },
-  "40": {
+  "138": {
+    "class_type": "PrimitiveStringMultiline",
     "inputs": {
-      "clip": [
-        "10",
-        0
-      ],
-      "text": "blurry, low resolution, pixelated, noisy, artifacts, distorted"
+      "value": "cinematic shot, natural motion, soft lighting"
     },
-    "class_type": "CLIPTextEncode"
+    "_meta": {
+      "title": "Prompt (SFW default)"
+    }
   },
-  "42": {
+  "149": {
+    "class_type": "KSamplerSelect",
     "inputs": {
-      "positive": [
-        "98",
-        0
-      ],
-      "negative": [
-        "40",
-        0
-      ],
-      "frame_rate": 24
+      "sampler_name": "res_multistep"
     },
-    "class_type": "LTXVConditioning"
+    "_meta": {
+      "title": "KSampler Select"
+    }
   },
-  "82": {
+  "150": {
+    "class_type": "BasicScheduler",
     "inputs": {
-      "unet_name": "sulpher/ltx2310eros_v1.safetensors",
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": ["222", 0]
+    },
+    "_meta": {
+      "title": "Basic Scheduler"
+    }
+  },
+  "151": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["153", 0],
+      "guider": ["152", 0],
+      "sampler": ["149", 0],
+      "sigmas": ["150", 0],
+      "latent_image": ["194", 1]
+    },
+    "_meta": {
+      "title": "Sampler Custom Advanced"
+    }
+  },
+  "152": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": ["222", 0],
+      "conditioning": ["194", 0]
+    },
+    "_meta": {
+      "title": "Basic Guider"
+    }
+  },
+  "153": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": "42"
+    },
+    "_meta": {
+      "title": "Random Noise (resolved to provider-injected Date.now() per request)"
+    }
+  },
+  "170": {
+    "class_type": "ImageResizeKJv2",
+    "inputs": {
+      "width": "512",
+      "height": "512",
+      "upscale_method": "lanczos",
+      "keep_proportion": "crop",
+      "pad_color": "0, 0, 0",
+      "crop_position": "top",
+      "divisible_by": 2,
+      "device": "cpu",
+      "image": ["220", 0]
+    },
+    "_meta": {
+      "title": "Image Resize (KJNodes v2)"
+    }
+  },
+  "194": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "prompt": ["138", 0],
+      "width": "512",
+      "height": "512",
+      "length": "5",
+      "first_frame": ["170", 0],
+      "vae": ["202", 0],
+      "clip": ["201", 0]
+    },
+    "_meta": {
+      "title": "MiniMax H3 Image to Video"
+    }
+  },
+  "200": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
       "weight_dtype": "default"
     },
-    "class_type": "UNETLoader"
+    "_meta": {
+      "title": "MiniMax H3 UNet (subgraph: 187:127)"
+    }
   },
-  "88": {
+  "201": {
+    "class_type": "CLIPLoader",
     "inputs": {
-      "noise_seed": 649376576548208
+      "type": "minimax",
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
     },
-    "class_type": "RandomNoise"
+    "_meta": {
+      "title": "MiniMax H3 CLIP (subgraph: 187:188)"
+    }
   },
-  "89": {
+  "202": {
+    "class_type": "VAELoader",
     "inputs": {
-      "noise_seed": 509076301173895
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
     },
-    "class_type": "RandomNoise"
+    "_meta": {
+      "title": "MiniMax H3 Video VAE (subgraph: 187:189)"
+    }
   },
-  "1": {
+  "203": {
+    "class_type": "VAELoader",
     "inputs": {
-      "sampler_name": "euler_cfg_pp"
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
     },
-    "class_type": "KSamplerSelect"
+    "_meta": {
+      "title": "MiniMax H3 Audio VAE (subgraph: 187:190)"
+    }
   },
-  "2": {
+  "204": {
+    "class_type": "ModelAttentionBackend",
     "inputs": {
-      "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+      "model": ["200", 0],
+      "attention": "comfy kitchen attention"
     },
-    "class_type": "ManualSigmas"
+    "_meta": {
+      "title": "Model Attention Backend (comfy kitchen — reverted 2026-08-31 from 'sage' after sage also rejected fp8 q_scale in rms_rope_split_half_). Last WORKING config (256s vs fp8+SA2 90s): native int8 weights + comfy kitchen attention, NO --use-sage-attention / NO --fp8_e4m3fn-unet CLI flags. Pending: await upstream MiniMax-H3 / ComfyUI guidance on fp8 rope kernel compatibility."
+    }
   },
-  "3": {
+  "209": {
+    "class_type": "SaveVideo",
     "inputs": {
-      "model": [
-        "82",
-        0
-      ],
-      "positive": [
-        "42",
-        0
-      ],
-      "negative": [
-        "42",
-        1
-      ],
-      "cfg": 1
+      "filename_prefix": "reelant_h3_i2v",
+      "format": "mp4",
+      "codec": "h264",
+      "save_output": true,
+      "video": ["210", 0]
     },
-    "class_type": "CFGGuider"
+    "_meta": {
+      "title": "Save Video (output: /modal-data/output/reelant_h3_i2v_*.mp4)"
+    }
   },
-  "1956": {
+  "210": {
+    "class_type": "CreateVideo",
     "inputs": {
-      "width": 224,
-      "height": 288,
-      "length": 2545,
-      "batch_size": 1
+      "fps": 24,
+      "bit_depth": 8,
+      "images": ["122", 0],
+      "audio": ["121", 0]
     },
-    "class_type": "EmptyLTXVLatentVideo"
+    "_meta": {
+      "title": "Create Video"
+    }
   },
-  "1972": {
+  "220": {
+    "class_type": "easy loadImageBase64",
     "inputs": {
-      "audio_vae": [
-        "15",
-        0
-      ],
-      "frames_number": 2545,
-      "frame_rate": 24,
-      "batch_size": 1
+      "base64_data": "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",
+      "image_output": "Preview",
+      "save_prefix": "reelant"
     },
-    "class_type": "LTXVEmptyLatentAudio"
+    "_meta": {
+      "title": "Load Image (Easy-Use base64)"
+    }
   },
-  "15": {
+  "221": {
+    "class_type": "LoraLoaderModelOnly",
     "inputs": {
-      "vae_name": "ltx2.3/LTX23_audio_vae_bf16.safetensors",
-      "device": "main_device",
-      "weight_dtype": "bf16"
+      "model": ["204", 0],
+      "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+      "strength_model": 1.0
     },
-    "class_type": "VAELoader"
+    "_meta": {
+      "title": "Turbo LoRA (model-only, strength 1.0) — primary slot for action/style LoRAs"
+    }
   },
-  "78": {
+  "401": {
+    "class_type": "LoraLoaderModelOnly",
     "inputs": {
-      "video_latent": [
-        "1956",
-        0
-      ],
-      "audio_latent": [
-        "1972",
-        0
-      ]
+      "model": ["221", 0],
+      "lora_name": "minimax-h3-digicam.safetensors",
+      "strength_model": 0.4
     },
-    "class_type": "LTXVConcatAVLatent"
+    "_meta": {
+      "title": "Digicam Y2K phone-effect LoRA (Civitai 2855485/3224980, strength 0.7)"
+    }
   },
-  "93": {
+  "222": {
+    "class_type": "MiniMaxH3SigmaShift",
     "inputs": {
-      "noise": [
-        "89",
-        0
-      ],
-      "guider": [
-        "3",
-        0
-      ],
-      "sampler": [
-        "1",
-        0
-      ],
-      "sigmas": [
-        "2",
-        0
-      ],
-      "latent_image": [
-        "78",
-        0
-      ]
+      "model": ["401", 0],
+      "shift_video": 12,
+      "shift_audio": 3
     },
-    "class_type": "SamplerCustomAdvanced"
-  },
-  "54": {
-    "inputs": {
-      "av_latent": [
-        "93",
-        0
-      ]
-    },
-    "class_type": "LTXVSeparateAVLatent"
-  },
-  "107": {
-    "inputs": {
-      "samples": [
-        "54",
-        0
-      ],
-      "vae": [
-        "21",
-        0
-      ],
-      "tile_size": 512,
-      "overlap": 64,
-      "temporal_size": 512,
-      "temporal_overlap": 4
-    },
-    "class_type": "VAEDecodeTiled"
-  },
-  "1993": {
-    "inputs": {
-      "images": [
-        "107",
-        0
-      ],
-      "audio": [
-        "102",
-        0
-      ],
-      "frame_rate": 24,
-      "loop_count": 0,
-      "filename_prefix": "LTX_Video",
-      "format": "video/h264-mp4",
-      "pix_fmt": "yuv420p",
-      "crf": 19,
-      "save_metadata": true,
-      "trim_to_audio": false,
-      "pingpong": false,
-      "save_output": true
-    },
-    "class_type": "VHS_VideoCombine"
-  },
-  "102": {
-    "inputs": {
-      "samples": [
-        "54",
-        1
-      ],
-      "audio_vae": [
-        "15",
-        0
-      ]
-    },
-    "class_type": "LTXVAudioVAEDecode"
-  },
-  "98": {
-    "inputs": {
-      "clip": [
-        "10",
-        0
-      ],
-      "text": "A beautiful woman with expressive eyes, cinematic lighting, detailed textures, professional photography"
-    },
-    "class_type": "CLIPTextEncode"
+    "_meta": {
+      "title": "MiniMax H3 Sigma Shift — consumes final LoRA in chain (node 401 = Digicam)"
+    }
   }
 }
