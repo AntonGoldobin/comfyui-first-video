@@ -300,6 +300,19 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 #   1. Run workflow via local ComfyUI on :8188 (same container, no HTTP proxy).
 #   2. Explicit volume.commit() before returning bytes — replaces R.137 watcher.
 # =============================================================================
+# Task A (2026-09-16): @modal.concurrent(target_inputs=4, max_inputs=4) lets
+# /api/result (sync FastAPI) serve polls while /api/run is mid-GPU-work on
+# the same H100 container. Without this, sync HTTP requests queue on the
+# container's threadpool until the GPU method returns (~minutes for a real
+# generation) — worker stalls on /api/result polling.
+# Modal Labs production-tested this combo on @modal.cls(enable_memory_snapshot=True)
+# + @modal.enter(snap=True) — see sglang_snapshot.py / ministral3_inference.py.
+# NOTE: decorator order matters — @app.cls OUTSIDE, @modal.concurrent INSIDE
+# (opposite of standard "wrap outside" intuition). Modal SDK raises
+# InvalidError("Cannot stack @modal.concurrent on top of @app.cls()") if
+# reversed. sglang_snapshot.py and ministral3_inference.py both confirm
+# this order.
+# MEMORY [[modal-container-concurrency-hang-2026-09-16]].
 @app.cls(
     image=image,
     volumes={"/modal-data": h3_models_volume},
@@ -321,6 +334,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     region="us-east",
     gpu="H100",
 )
+@modal.concurrent(target_inputs=4, max_inputs=4)
 class H3Generator:
     @modal.enter(snap=True)
     def setup(self):
