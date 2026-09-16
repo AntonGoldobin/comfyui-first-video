@@ -320,7 +320,14 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     cpu=4,
     memory=16384,
     timeout=1800,                  # class-level container lifetime cap
-    enable_memory_snapshot=True,   # snapshot after @modal.enter() completes
+    # Task E (2026-09-16): enable_memory_snapshot=False — restore never
+    # works for this app (Modal logs: 4 captures in 4h, 0 restores).
+    # Restore-fail fallback adds ~8 min delay per cold-start before
+    # Modal gives up and runs full setup(). Without snapshot: setup()
+    # runs 27-81s every cold-start, no restore-fail delay.
+    # @modal.enter(snap=True) below is now a no-op (kept for clarity).
+    # MEMORY [[modal-snapshot-restore-never-happens-2026-09-16]].
+    enable_memory_snapshot=False,
     min_containers=0,
     scaledown_window=5,
     max_containers=20,
