@@ -102,10 +102,12 @@ _R119_SECRETS = [modal.Secret.from_name("reelant-s3")]
 # =============================================================================
 try:
     import botocore.auth as _bc_auth
-    _orig_modify = _bc_auth.S3SigV4Auth._modify_request_before_signing
+    _orig_modify_ref = _bc_auth.S3SigV4Auth._modify_request_before_signing
 
     def _upayload_modify(self, request):
-        request = _orig_modify(self, request)  # must return — SigV4Auth.sign() passes result to super().sign()
+        # Call original — mutates request.headers['x-amz-content-sha256'] in place.
+        # Don't capture return — original returns None. Then override header.
+        _orig_modify_ref(self, request)
         request.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
         return request
 
