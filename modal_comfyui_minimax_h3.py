@@ -1049,6 +1049,10 @@ class H3Generator:
             # separately. We do a minimal injection into the JSON if the
             # node exists — keeps the API ergonomic.
             try:
+                # _json (the function-local alias) is only defined inside
+                # _write_failure_marker(). Import json here so the harness
+                # actually parses the JSON instead of NameError-warn-skipping.
+                import json as _json
                 wj = workflow_json if isinstance(workflow_json, dict) else _json.loads(workflow_json)
                 for node_id, node in wj.items():
                     if isinstance(node, dict) and node.get("class_type") == "easy loadImageBase64":
