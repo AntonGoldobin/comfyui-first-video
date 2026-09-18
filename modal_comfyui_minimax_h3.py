@@ -314,8 +314,6 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     timeout=1800,                  # class-level container lifetime cap
     enable_memory_snapshot=True,   # snapshot after @modal.enter() completes
     min_containers=0,
-    scaledown_window=5,
-    max_containers=20,
     scaledown_window=300,  # Task H (2026-09-17): 60→300 — Task C worker pre-warm on /api/run guarantees container alive at submit time, so 60s scaledown_window (Task G) was overkill. Bump back to 300s for safety margin: covers burst pattern (Gen 1 → 7+ min polling → Gen 2) where worker is busy on Gen 1 result fetch when Gen 2 pre-warm fires. With Task C + max_containers=1 + scaledown_window=300: container cold-starts ONCE per idle gap (≥300s = 5 min), then reused across burst.
     max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=4, max_inputs=4) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time.
     # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
@@ -690,6 +688,14 @@ class H3Generator:
         """
         log.info(f"generate nonce={nonce}: starting (call_id-based)")
         t0 = time.time()
+        # Method-scope boto3 import (matching FastAPI/httpx convention at L36+).
+        # Module-scope import breaks `modal deploy` local introspection —
+        # Modal CLI imports this file in the local venv where boto3 is not
+        # installed (it's only in the Modal image per L128). Defer to method
+        # scope so introspection passes; boto3 is available at runtime because
+        # the Modal image installs it. MEMORY
+        # [[reelant-modal-spawn-no-s3-put-2026-09-18]].
+        import boto3
         result_bytes = self._run_workflow(workflow_json, image_b64, nonce)
         elapsed = time.time() - t0
         log.info(
@@ -774,7 +780,6 @@ class H3Generator:
         Signature uses Modal's recommended pattern — `payload: dict` directly.
         sync `def` is fine here: .remote() blocks until generate() returns.
         """
-        import boto3
         from fastapi import HTTPException
 
         workflow_json = payload.get("workflow")
