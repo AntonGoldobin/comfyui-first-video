@@ -82,38 +82,107 @@ _R119_SECRETS = [modal.Secret.from_name("reelant-s3")]
 
 
 # =============================================================================
-# XAmzContentSHA256Mismatch workaround — UNSIGNED-PAYLOAD SigV4 auth.
-# When Modal's boto3 PUT traverses the Modal gateway → CapRover nginx → MinIO,
-# something along the path modifies body bytes (or recomputes the request
-# signature header). boto3 pre-computes SHA256(body) → sets
-# x-amz-content-sha256 header → sign. If the body that MinIO receives differs
-# by even one byte, MinIO rejects with XAmzContentSHA256Mismatch.
+# Task #176 (2026-09-18): Manual SigV4 PUT — bypass boto3 entirely.
 #
-# UNSIGNED-PAYLOAD tells MinIO to compute SHA256 from the actual received body
-# instead of trusting the header — sidesteps the mismatch entirely. SigV4 still
-# authenticates via the Authorization header (region/scope/signature), so this
-# is NOT a security regression — just body-hash bypass. See Task #176.
+# Background: Modal's boto3 put_object to s3-api.cr.golden-antelope.ru fails
+# with XAmzContentSHA256Mismatch (v65-v67) or SignatureDoesNotMatch (v68-v70)
+# — deterministic, only from Modal's egress. The same endpoint works from
+# worker's AWS SDK v3 (Node.js) on the same CapRover VPS. Manual local
+# boto3 PUT also works. The failure is specific to Modal-boto3.
 #
-# Implementation: module-level monkey-patch on botocore.auth.S3SigV4Auth. After
-# import, every S3 client created in this process uses UNSIGNED-PAYLOAD. We
-# can't replace the signer object directly — the Endpoint attribute name
-# (`_request_signer` / `signer`) varies across botocore versions. Class-level
-# monkey-patch is the stable interface.
+# UNSIGNED-PAYLOAD attempt (v68-v70) doesn't help — this MinIO rejects it
+# with SignatureDoesNotMatch. We don't know yet whether the issue is
+# boto3-specific body framing, Content-Length handling, or some Modal egress
+# proxy modification. The cleanest debug is to bypass boto3 entirely and
+# control the exact bytes on the wire via stdlib urllib.
+#
+# 40-line manual SigV4 PUT (this block). If it works → boto3-specific
+# framing issue (could be addressed later, or stay with this manual impl).
+# If it ALSO fails with SHA mismatch → root cause is in-transit body
+# modification (VPS-level nginx config fix needed, not client-side).
 # =============================================================================
-try:
-    import botocore.auth as _bc_auth
-    _orig_modify_ref = _bc_auth.S3SigV4Auth._modify_request_before_signing
+import hashlib as _hashlib
+import hmac as _hmac
+import datetime as _datetime
+import urllib.request as _urlreq
+import urllib.error as _urlerr
 
-    def _upayload_modify(self, request):
-        # Call original — mutates request.headers['x-amz-content-sha256'] in place.
-        # Don't capture return — original returns None. Then override header.
-        _orig_modify_ref(self, request)
-        request.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
-        return request
 
-    _bc_auth.S3SigV4Auth._modify_request_before_signing = _upayload_modify
-except ImportError:
-    pass  # botocore missing — fail at PUT time, not import time
+def _sigv4_put(url, body, *, access_key, secret_key, region, bucket, key,
+               content_type="video/mp4"):
+    """PUT `body` to S3 via manual SigV4 (bypasses botocore entirely).
+
+    Path-style addressing: URL is `https://host` (no path); we append
+    `/{bucket}/{key}`. Returns (status_code, response_body_bytes).
+    Raises urllib.error.HTTPError on 4xx/5xx (caller decides retry).
+    """
+    now = _datetime.datetime.utcnow()
+    date_stamp = now.strftime("%Y%m%d")
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    payload_hash = _hashlib.sha256(body).hexdigest()
+
+    # Parse host from URL.
+    host = url.split("://", 1)[1].split("/", 1)[0]
+
+    canonical_uri = f"/{bucket}/{key}"
+    canonical_querystring = ""
+    canonical_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+
+    canonical_request = (
+        f"PUT\n"
+        f"{canonical_uri}\n"
+        f"{canonical_querystring}\n"
+        f"{canonical_headers}\n"
+        f"{signed_headers}\n"
+        f"{payload_hash}"
+    )
+
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n"
+        f"{credential_scope}\n"
+        f"{_hashlib.sha256(canonical_request.encode()).hexdigest()}"
+    )
+
+    def _sign(key, msg):
+        return _hmac.new(key, msg.encode(), _hashlib.sha256).digest()
+
+    k_date = _sign(f"AWS4{secret_key}".encode(), date_stamp)
+    k_region = _sign(k_date, region)
+    k_service = _sign(k_region, "s3")
+    k_signing = _sign(k_service, "aws4_request")
+    signature = _hmac.new(k_signing, string_to_sign.encode(),
+                          _hashlib.sha256).hexdigest()
+
+    auth_header = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    req = _urlreq.Request(
+        url + canonical_uri,
+        data=body,
+        method="PUT",
+        headers={
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+            "Authorization": auth_header,
+        },
+    )
+    try:
+        with _urlreq.urlopen(req, timeout=120) as resp:
+            return resp.status, resp.read()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read()
 
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
@@ -745,24 +814,27 @@ class H3Generator:
         # BEFORE .spawn() caller's HTTP response returns. Worker polls S3 by
         # `generations/{nonce}.mp4` (see worker pollS3ByGenId). PUT is
         # idempotent on key — safe to retry.
+        #
+        # Task #176 (2026-09-18): boto3 PUT fails with XAmzContentSHA256Mismatch
+        # from Modal's egress. Bypass boto3 entirely with manual SigV4 PUT via
+        # stdlib urllib. See _sigv4_put() docstring for rationale.
         s3_key = f"generations/{nonce}.mp4"
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=os.environ["AWS_ENDPOINT_URL"],
-            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        status, _resp = _sigv4_put(
+            os.environ["AWS_ENDPOINT_URL"],
+            result_bytes,
+            access_key=os.environ["AWS_ACCESS_KEY_ID"],
+            secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region=os.environ.get("AWS_REGION", "us-east-1"),
+            bucket=os.environ["S3_BUCKET"],
+            key=s3_key,
+            content_type="video/mp4",
         )
-        # Task #176 (2026-09-18): UNSIGNED-PAYLOAD SigV4 monkey-patched at module
-        # load — every S3 client in this process uses it (see class docstring).
-        s3.put_object(
-            Bucket=os.environ["S3_BUCKET"],
-            Key=s3_key,
-            Body=result_bytes,
-            ContentType="video/mp4",
-        )
+        if status not in (200, 204):
+            raise RuntimeError(
+                f"S3 PUT failed status={status} nonce={nonce} body={_resp!r}"
+            )
         log.info(
-            f"generate nonce={nonce} S3 PUT OK "
+            f"generate nonce={nonce} S3 PUT OK status={status} "
             f"s3://{os.environ['S3_BUCKET']}/{s3_key} ({len(result_bytes)} bytes)"
         )
 
