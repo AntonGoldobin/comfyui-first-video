@@ -327,7 +327,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     gpu="H100",
 )
 class H3Generator:
-    @modal.enter(snap=True)
+    @modal.enter(snap=False)  # Task #176: disable snap entirely — no snapshot, full cold-start every idle gap
     def setup(self):
         """Initialize GPU container once per cold start. Symlinks models,
         launches ComfyUI subprocess on :8188, waits for ready. Snapshotted."""
