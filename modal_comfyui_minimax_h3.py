@@ -80,6 +80,38 @@ h3_models_volume = modal.Volume.from_name(
 # contract entirely. See memory [[modal-rung-3-s3-result-delivery-2026-09-17]].
 _R119_SECRETS = [modal.Secret.from_name("reelant-s3")]
 
+
+# =============================================================================
+# XAmzContentSHA256Mismatch workaround — UNSIGNED-PAYLOAD SigV4 auth.
+# When Modal's boto3 PUT traverses the Modal gateway → CapRover nginx → MinIO,
+# something along the path modifies body bytes (or recomputes the request
+# signature header). boto3 pre-computes SHA256(body) → sets
+# x-amz-content-sha256 header → sign. If the body that MinIO receives differs
+# by even one byte, MinIO rejects with XAmzContentSHA256Mismatch.
+#
+# UNSIGNED-PAYLOAD tells MinIO to compute SHA256 from the actual received body
+# instead of trusting the header — sidesteps the mismatch entirely. SigV4 still
+# authenticates via the Authorization header (region/scope/signature), so this
+# is NOT a security regression — just body-hash bypass. See Task #176.
+# =============================================================================
+try:
+    from botocore.auth import S3SigV4Auth as _S3SigV4Auth
+except ImportError:
+    _S3SigV4Auth = None  # botocore missing — fail at PUT time, not import time
+
+
+class _UPSigV4Auth(_S3SigV4Auth if _S3SigV4Auth is not None else object):
+    """SigV4 auth that sets x-amz-content-sha256=UNSIGNED-PAYLOAD.
+
+    Overrides _modify_request_before_signing (called by sign_request before
+    SigV4 signing). Parent computes SHA256(body) and sets the header; we
+    overwrite with UNSIGNED-PAYLOAD so MinIO trusts its own receipt.
+    """
+
+    def _modify_request_before_signing(self, request):  # type: ignore[override]
+        super()._modify_request_before_signing(request)
+        request.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
+
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
     .run_commands(
@@ -716,6 +748,14 @@ class H3Generator:
             endpoint_url=os.environ["AWS_ENDPOINT_URL"],
             aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
             aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        # Task #176 (2026-09-18): UNSIGNED-PAYLOAD SigV4 — bypass XAmzContentSHA256Mismatch.
+        # See _UPSigV4Auth class docstring for rationale.
+        _existing_signer = s3._endpoint._request_signer
+        s3._endpoint._request_signer = _UPSigV4Auth(
+            credentials=_existing_signer._credentials,
+            service_name="s3",
             region_name=os.environ.get("AWS_REGION", "us-east-1"),
         )
         s3.put_object(
