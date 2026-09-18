@@ -93,24 +93,24 @@ _R119_SECRETS = [modal.Secret.from_name("reelant-s3")]
 # instead of trusting the header — sidesteps the mismatch entirely. SigV4 still
 # authenticates via the Authorization header (region/scope/signature), so this
 # is NOT a security regression — just body-hash bypass. See Task #176.
+#
+# Implementation: module-level monkey-patch on botocore.auth.S3SigV4Auth. After
+# import, every S3 client created in this process uses UNSIGNED-PAYLOAD. We
+# can't replace the signer object directly — the Endpoint attribute name
+# (`_request_signer` / `signer`) varies across botocore versions. Class-level
+# monkey-patch is the stable interface.
 # =============================================================================
 try:
-    from botocore.auth import S3SigV4Auth as _S3SigV4Auth
-except ImportError:
-    _S3SigV4Auth = None  # botocore missing — fail at PUT time, not import time
+    import botocore.auth as _bc_auth
+    _orig_modify = _bc_auth.S3SigV4Auth._modify_request_before_signing
 
-
-class _UPSigV4Auth(_S3SigV4Auth if _S3SigV4Auth is not None else object):
-    """SigV4 auth that sets x-amz-content-sha256=UNSIGNED-PAYLOAD.
-
-    Overrides _modify_request_before_signing (called by sign_request before
-    SigV4 signing). Parent computes SHA256(body) and sets the header; we
-    overwrite with UNSIGNED-PAYLOAD so MinIO trusts its own receipt.
-    """
-
-    def _modify_request_before_signing(self, request):  # type: ignore[override]
-        super()._modify_request_before_signing(request)
+    def _upayload_modify(self, request):
+        _orig_modify(self, request)
         request.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
+
+    _bc_auth.S3SigV4Auth._modify_request_before_signing = _upayload_modify
+except ImportError:
+    pass  # botocore missing — fail at PUT time, not import time
 
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
@@ -750,14 +750,8 @@ class H3Generator:
             aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
             region_name=os.environ.get("AWS_REGION", "us-east-1"),
         )
-        # Task #176 (2026-09-18): UNSIGNED-PAYLOAD SigV4 — bypass XAmzContentSHA256Mismatch.
-        # See _UPSigV4Auth class docstring for rationale.
-        _existing_signer = s3._endpoint._request_signer
-        s3._endpoint._request_signer = _UPSigV4Auth(
-            credentials=_existing_signer._credentials,
-            service_name="s3",
-            region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        )
+        # Task #176 (2026-09-18): UNSIGNED-PAYLOAD SigV4 monkey-patched at module
+        # load — every S3 client in this process uses it (see class docstring).
         s3.put_object(
             Bucket=os.environ["S3_BUCKET"],
             Key=s3_key,
