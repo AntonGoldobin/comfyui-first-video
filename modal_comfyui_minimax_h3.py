@@ -11,6 +11,7 @@ Reuses the proven scaffold from modal_comfyui.py:
   - /ComfyUI mount, --output-directory /modal-data/output, ASGI proxy
   - copy_dir_contents from Modal Volume to /ComfyUI/models/
   - same 600s startup, 1800s timeout, 5s scaledown_window (R.117, 2026-09-01)
+  - same 600s startup, 1800s timeout, 300s scaledown_window (R.117 5s, Task F 2026-09-16 → 120s, Task B 2026-09-17 → 300s, Task G 2026-09-17 → 60s + max_containers=1, Task H 2026-09-17 → 300s paired with Task C worker pre-warm)
 
 Differences from modal_comfyui.py:
   - app name: comfyui-minimax-h3
@@ -73,7 +74,11 @@ h3_models_volume = modal.Volume.from_name(
 # worker retry happens, it re-polls the SAME call_id (not a new spawn), so
 # concurrent submits with the same nonce are the WORKER's responsibility, not
 # Modal's. Task #163 already added this dedup.
-_R119_SECRETS = []
+# Rung 3 (2026-09-17): add `reelant-s3` Modal Secret (AWS creds + endpoint) so
+# api_run can PUT the result MP4 directly to Cr.Golden-Antelope S3. Worker
+# polls S3 by gen_id instead of polling Modal — eliminates the 303/Location
+# contract entirely. See memory [[modal-rung-3-s3-result-delivery-2026-09-17]].
+_R119_SECRETS = [modal.Secret.from_name("reelant-s3")]
 
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
@@ -120,7 +125,7 @@ image = (
         "done",
         "pip install --no-cache-dir opencv-python imageio_ffmpeg",
         # ASGI proxy deps (serve() uses FastAPI + httpx)
-        "pip install --no-cache-dir fastapi httpx 'starlette>=0.36'",
+        "pip install --no-cache-dir fastapi httpx 'starlette>=0.36' boto3",
         # Sage attention — soft requirement for MiniMax H3 (recommended in docs.comfy.org).
         # MUST install from git — SageAttention 2.2.0 is NOT on PyPI (latest = 1.0.6, Nov 2024).
         # PyPI install of "sageattention==2.2.0" silently fails with "No matching distribution",
@@ -311,6 +316,8 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     min_containers=0,
     scaledown_window=5,
     max_containers=20,
+    scaledown_window=300,  # Task H (2026-09-17): 60→300 — Task C worker pre-warm on /api/run guarantees container alive at submit time, so 60s scaledown_window (Task G) was overkill. Bump back to 300s for safety margin: covers burst pattern (Gen 1 → 7+ min polling → Gen 2) where worker is busy on Gen 1 result fetch when Gen 2 pre-warm fires. With Task C + max_containers=1 + scaledown_window=300: container cold-starts ONCE per idle gap (≥300s = 5 min), then reused across burst.
+    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=4, max_inputs=4) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time.
     # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
     # MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
     buffer_containers=0,
@@ -687,42 +694,87 @@ class H3Generator:
         elapsed = time.time() - t0
         log.info(
             f"generate nonce={nonce}: DONE in {elapsed:.1f}s "
-            f"({len(result_bytes)} bytes)"
+            f"({len(result_bytes)} bytes) -- uploading to S3"
         )
+
+        # Rung 5 (2026-09-18): S3 PUT inside generate() so result is durable
+        # BEFORE .spawn() caller's HTTP response returns. Worker polls S3 by
+        # `generations/{nonce}.mp4` (see worker pollS3ByGenId). PUT is
+        # idempotent on key — safe to retry.
+        s3_key = f"generations/{nonce}.mp4"
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        s3.put_object(
+            Bucket=os.environ["S3_BUCKET"],
+            Key=s3_key,
+            Body=result_bytes,
+            ContentType="video/mp4",
+        )
+        log.info(
+            f"generate nonce={nonce} S3 PUT OK "
+            f"s3://{os.environ['S3_BUCKET']}/{s3_key} ({len(result_bytes)} bytes)"
+        )
+
         return result_bytes
 
+    # Rung 3 (2026-09-17): Result-via-S3. Modal writes MP4 to S3 BEFORE
+    # returning, so the HTTP response is tiny (~200 bytes) and Modal's 150s
+    # gateway limit becomes irrelevant — worker polls S3 by gen_id, not Modal.
+    # See memory [[modal-rung-3-s3-result-delivery-2026-09-17]] for full design.
+    #
+    # Replaces Task #229 / Path Z's inline bytes-in-handles approach. Why:
+    #   - Task #229's .remote() returning inline bytes = ~5-10MB body.
+    #     Cold-start + inference = 144-272s. On >150s Modal gates with 303
+    #     transport break, worker has to follow undocumented Location URL.
+    #   - Rung 3: response is {status, s3_key, ...} = ~200 bytes. Even on
+    #     cold-start 272s, Modal 303 fires but worker doesn't need to follow
+    #     it — it just polls S3 by the expected key. Modal is OUT of the
+    #     polling path entirely.
     @modal.fastapi_endpoint(method="POST")
     def api_run(self, payload: dict) -> dict:
-        """Task #91 (2026-09-12) + Task #218 (2026-09-13): spawn-and-return.
+        """Rung 3 (2026-09-17): write MP4 to S3 + return status.
 
-        Spawns H3Generator.generate() via .spawn() — Modal returns IMMEDIATELY
-        with a FunctionCall handle. Worker polls api_result with the returned
-        call_id to retrieve the result.
+        Calls H3Generator.generate() via .remote() (NOT .spawn()) — Modal
+        BLOCKS this request thread until generate() returns. Then PUTs the
+        result to S3 at `generations/{nonce}.mp4`. Worker polls S3 by gen_id
+        to know when result is ready.
 
-        Why .spawn() instead of .local() (the previous Task #91 behavior):
-          - .local() blocks the request thread until generate() returns —
-            gates us on the 150s Modal gateway transport break. Cold-start
-            can be >300s; any /api/run POST after that window hits a 303
-            redirect with no result payload. Worker falls back to polling,
-            which works but adds latency.
-          - .spawn() returns the FunctionCall handle in <1s. The request
-            thread is freed immediately. Generate runs to completion
-            server-side, result captured by Modal's FunctionCall infra.
-            Worker polls api_result with call_id — no 303 risk, no
-            thread-blocking, no cold-start window coupling.
+        Three response shapes:
+          - 200 + {status: "done", s3_key, nonce, elapsed_s, size_bytes}
+                  — generate() OK AND S3 PUT succeeded (worker downloads from S3)
+          - 200 + {status: "failed", error} — generate() raised or S3 PUT failed
+                  (worker throws RemoteFailedError → auto-refund)
+          - 303 + Location: <redirect_url> — Modal 150s gateway break (cold-start
+                  exceeded 150s). Worker treats as "submitted, in flight" — polls
+                  S3 by `generations/{nonce}.mp4`. Modal is OUT of polling path.
+
+        Why S3 (and the inline-bytes history):
+          - Task #229 (Rung 1, 2026-09-17): inline `video_b64` JSON envelope.
+            Worked for warm path (<150s), failed at Modal 303 on cold-start —
+            worker had to follow undocumented `__modal_attempt_token` Location URL.
+            7 prior Tasks (#218, #228, #255, #260, #261, #265c-#265f) patched
+            different corners of the 303 + polling contract, none structurally
+            eliminated it.
+          - Rung 3 (this code): Modal writes result to S3 BEFORE returning. S3
+            is the durable, idempotent result store — worker polls S3 by
+            `generations/{nonce}.mp4`. Modal function can run for its full
+            24h timeout; HTTP response is just ~200 bytes. No 303 follow
+            needed (worker doesn't care if Modal timed out at gateway — S3
+            file either appears or doesn't).
 
         URL: Modal auto-names this as <app>-<class>-<method>.modal.run:
             https://anton722451--comfyui-minimax-h3-h3generator-api-run.modal.run
-        Worker calls this URL directly (no /api/run suffix — it's now the
-        root of the endpoint).
+        Worker calls this URL directly.
 
-        Signature uses Modal's recommended pattern — `payload: dict` directly
-        (NOT `request: Request`). Modal/FastAPI introspects the signature and
-        sees `dict` → treats the JSON body as the dict. With `Request` in the
-        signature, FastAPI treats `request` as a query parameter (returns 422).
-        sync `def` is fine here: payload parsing is automatic; .spawn() is
-        non-blocking (returns immediately with FunctionCall handle).
+        Signature uses Modal's recommended pattern — `payload: dict` directly.
+        sync `def` is fine here: .remote() blocks until generate() returns.
         """
+        import boto3
         from fastapi import HTTPException
 
         workflow_json = payload.get("workflow")
@@ -754,103 +806,33 @@ class H3Generator:
         if not workflow_json:
             raise HTTPException(status_code=400, detail="missing workflow")
 
-        log.info(f"api_run nonce={nonce} spawning workflow")
+        log.info(f"api_run nonce={nonce} starting .spawn() generate (Rung 5: S3-only polling)")
 
-        # Task #218: .spawn() (NOT .local()) — Modal SDK descriptor protocol.
-        # .spawn() returns immediately with a FunctionCall handle. The heavy
-        # work happens server-side; we don't block this request thread. The
-        # 150s gateway transport break CANNOT fire because we return in <1s.
+        # Rung 5 (2026-09-18): .spawn() returns FunctionCall ID immediately.
+        # HTTP response is <100ms regardless of cold-start or inference time.
+        # Worker polls S3 by `generations/{nonce}.mp4` (see worker
+        # pollS3ByGenId). Modal is OUT of the polling path entirely.
+        # Modal's 150s gateway break no longer matters — S3 file either
+        # appears (PUT inside generate()) or doesn't.
         try:
-            call = self.generate.spawn(workflow_json, image_b64, nonce)
+            fut = self.generate.spawn(workflow_json, image_b64, nonce)
         except Exception as e:
             log.exception(f"api_run nonce={nonce} spawn failed")
-            raise HTTPException(status_code=500, detail=f"spawn_failed: {str(e)[:500]}")
+            return {
+                "status": "failed",
+                "nonce": nonce,
+                "error": f"spawn_failed: {str(e)[:500]}",
+            }
 
-        log.info(f"api_run nonce={nonce} spawned call_id={call.object_id}")
+        log.info(
+            f"api_run nonce={nonce} .spawn() returned call_id={fut.object_id} "
+            f"(HTTP response <100ms — worker polls S3 from here)"
+        )
+
         return {
-            "status": "queued",
+            "status": "accepted",
             "nonce": nonce,
-            "call_id": call.object_id,
-        }
-
-    @modal.fastapi_endpoint(method="GET")
-    def api_result(self, call_id: str) -> dict:
-        """Task #218 (2026-09-13): poll call result via FunctionCall.from_id.
-
-        URL: Modal auto-names this as <app>-<class>-<method>.modal.run.
-        Worker hits `${MODAL_RESULT_URL}/?call_id={call_id}` (query-param
-        style because @modal.fastapi_endpoint does NOT support path args —
-        see [[modal-fastapi-endpoint-no-path-arg-2026-09-10]]).
-
-        Returns (FastAPI JSON):
-          200 + {video_b64, elapsed_s, size_bytes, call_id, status: "done"}
-                — generate() completed successfully
-          202 + {status: "running"} — call exists but generate() not done yet
-          404 + {error: "call_not_found"} — call_id unknown or expired (Modal
-                FunctionCall state is bounded; default ttl ~hours)
-          500 + {error, detail} — generate() raised an exception; surface
-                the message so worker can classify (REMOTE_FAILED, etc.)
-
-        Implements Option A per Modal docs (community-blessed pattern for
-        async result retrieval):
-          https://modal.com/docs/guide/webhook-timeouts (see .spawn() section)
-          https://modal.com/docs/guide/trigger-deployed-functions
-        """
-        import base64 as _b64
-        from fastapi.responses import JSONResponse
-
-        t0 = time.time()
-        try:
-            function_call = modal.FunctionCall.from_id(call_id)
-        except modal.exception.NotFoundError:
-            log.warning(f"api_result call_id={call_id}: not_found")
-            return JSONResponse(
-                {"error": "call_not_found", "call_id": call_id},
-                status_code=404,
-            )
-        except Exception as e:
-            log.exception(f"api_result call_id={call_id}: from_id failed")
-            return JSONResponse(
-                {"error": "from_id_failed", "detail": str(e)[:500]},
-                status_code=500,
-            )
-
-        try:
-            # Non-blocking poll — raises TimeoutError immediately if not done.
-            # Modal internal state — no Dict eventual-consistency window
-            # (Task #218 / Option A).
-            result_bytes = function_call.get(timeout=0)
-        except TimeoutError:
-            return JSONResponse(
-                {"status": "running", "call_id": call_id},
-                status_code=202,
-            )
-        except modal.exception.NotFoundError:
-            log.warning(f"api_result call_id={call_id}: expired between from_id and get")
-            return JSONResponse(
-                {"error": "call_not_found", "call_id": call_id},
-                status_code=404,
-            )
-        except Exception as e:
-            # generate() raised — Modal wraps the exception inside FunctionCall.get().
-            # Surface the message; worker classifies via WorkerRemoteError.
-            err_str = str(e)
-            log.exception(f"api_result call_id={call_id}: generation failed: {err_str[:200]}")
-            return JSONResponse(
-                {"error": "generation_failed", "detail": err_str[:500], "call_id": call_id},
-                status_code=500,
-            )
-
-        # Success — encode bytes to base64 (FastAPI jsonable_encoder fails on bytes,
-        # same H.264 0xc3 issue that bit /api/status pre-fix). Worker consumes the
-        # JSON envelope identically to Task #91's bytes-in-handler path.
-        elapsed = time.time() - t0
-        return {
-            "status": "done",
-            "video_b64": _b64.b64encode(result_bytes).decode("ascii"),
-            "elapsed_s": round(elapsed, 2),
-            "size_bytes": len(result_bytes),
-            "call_id": call_id,
+            "call_id": fut.object_id,
         }
 
     def _run_workflow(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
