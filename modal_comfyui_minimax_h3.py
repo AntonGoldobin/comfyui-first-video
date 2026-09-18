@@ -184,6 +184,70 @@ def _sigv4_put(url, body, *, access_key, secret_key, region, bucket, key,
     except _urlerr.HTTPError as e:
         return e.code, e.read()
 
+
+def _write_failure_marker(nonce: str, *, error: str) -> None:
+    """Task #178 (2026-09-18): fail-fast signal for Rung 5 .spawn() workers.
+
+    Modal `.spawn()` is fire-and-forget — RuntimeError inside `generate()` does
+    not propagate to the HTTP caller (worker's submitRemoteJob). Without this
+    marker, worker polls S3 for the MP4 up to 25 min until sweeper force-fails.
+
+    Writes a small JSON sidecar at `generations/{nonce}.failed.json` so worker's
+    pollS3ByGenId can HEAD it BEFORE polling `.mp4` and throw RemoteFailedError
+    immediately (Layer B in Task #178).
+
+    Reuses `_sigv4_put()` from Task #176 (manual SigV4 PUT bypasses boto3
+    SHA/Sig mismatch against s3-api.cr.golden-antelope.ru).
+    """
+    import json as _json
+    import time as _time
+    key = f"generations/{nonce}.failed.json"
+    body = _json.dumps({
+        "nonce": nonce,
+        "error": error[:500],
+        "failed_at": _time.time(),
+    }).encode("utf-8")
+    try:
+        status, _resp = _sigv4_put(
+            url=os.environ["S3_ENDPOINT_URL"],
+            body=body,
+            access_key=os.environ["AWS_ACCESS_KEY_ID"],
+            secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            region=os.environ.get("AWS_REGION", "us-east-1"),
+            bucket=os.environ["S3_BUCKET"],
+            key=key,
+            content_type="application/json",
+        )
+        log.info(f"failure marker PUT status={status} key={key}")
+    except Exception as e:
+        # Marker write MUST NOT mask the original RuntimeError — log loud, return.
+        log.error(f"_write_failure_marker nonce={nonce} FAILED: {e!r}")
+
+
+def _with_failure_marker(method):
+    """Task #178: decorator that wraps `_run_workflow` (and similar) so any
+    RuntimeError raised inside (e.g. OOM at node 151 SamplerCustomAdvanced —
+    comfy_kitchen.int8_linear workspace exceeds H100 80GB VRAM for params
+    width=1344 height=768 length=90 on minimax-h3-i2v) writes a fail-fast
+    marker to S3 BEFORE re-raising.
+
+    Other exceptions (httpx.HTTPError, etc.) propagate unchanged — only
+    workflow-level RuntimeErrors trigger the marker (these are the cases
+    where worker has no other signal that the job is dead).
+    """
+    import functools as _ft
+    @_ft.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        nonce = kwargs.get("nonce") or (args[2] if len(args) >= 3 else None)
+        try:
+            return method(self, *args, **kwargs)
+        except RuntimeError as e:
+            if nonce:
+                _write_failure_marker(nonce, error=str(e))
+            raise
+    return wrapper
+
+
 image = (
     modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
     .run_commands(
@@ -264,7 +328,7 @@ image = (
         # in torch.nested.nested_tensor.NestedTensor (SDPA / attention backend may emit
         # nested tensors under certain conditions). NestedTensor lacks .clone().
         # Fix: convert NestedTensor → dense padded tensor before clone.
-        "python3 - <<'EOF'\nimport sys\np = '/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler/nodes/minimax_h3_latent_upscaler_2d.py'\ntry:\n    with open(p) as f:\n        src = f.read()\nexcept FileNotFoundError:\n    print(f'WARN: {p} not found — skipping upscaler patch', file=sys.stderr)\n    sys.exit(0)\nold = '        s = latent[\"samples\"].clone()\\n        orig_dtype = s.dtype'\nnew = '''        samples_in = latent[\"samples\"]\n        # Patch 2026-09-01 (R.109): NestedTensor inputs lack .clone(). Convert to dense.\n        if hasattr(samples_in, 'is_nested') and samples_in.is_nested:\n            samples_in = samples_in.to_padded_tensor(0)\n        s = samples_in.clone()\n        orig_dtype = s.dtype'''\nif old in src:\n    src = src.replace(old, new)\n    with open(p, 'w') as f:\n        f.write(src)\n    print('Patched: MinimaxH3LatentUpscalerNode2D NestedTensor → dense')\nelse:\n    print('PATCH ALREADY APPLIED or pattern not found — leaving file unchanged')\nEOF",
+        "python3 - <<'EOF'\nimport sys\np = '/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler/nodes/minimax_h3_latent_upscaler_2d.py'\ntry:\n    with open(p) as f:\n        src = f.read()\nexcept FileNotFoundError:\n    print(f'WARN: {p} not found — skipping upscaler patch', file=sys.stderr)\n    sys.exit(0)\nold = '        s = latent[\"samples\"].clone()\\n        orig_dtype = s.dtype'\nnew = '''        samples_in = latent[\"samples\"]\n        # DEBUG 2026-09-18 (LowUpscaled revival): print real type + attrs\n        # coming from H3 sampler (node 151). Revert after diagnosis.\n        print(f\"[UPSCALER-DEBUG] type={type(samples_in).__module__}.{type(samples_in).__name__}\",\n              f\"shape={getattr(samples_in, 'shape', None)}\",\n              f\"has_is_nested={hasattr(samples_in, 'is_nested')}\",\n              f\"has_to_padded_tensor={hasattr(samples_in, 'to_padded_tensor')}\",\n              f\"has_clone={hasattr(samples_in, 'clone')}\",\n              f\"has_to_dense={hasattr(samples_in, 'to_dense')}\",\n              f\"is_nested_val={getattr(samples_in, 'is_nested', 'N/A')}\",\n              file=sys.stderr, flush=True)\n        # Patch 2026-09-01 (R.109): NestedTensor inputs lack .clone(). Convert to dense.\n        if hasattr(samples_in, 'is_nested') and samples_in.is_nested:\n            samples_in = samples_in.to_padded_tensor(0)\n        s = samples_in.clone()\n        orig_dtype = s.dtype'''\nif old in src:\n    src = src.replace(old, new)\n    with open(p, 'w') as f:\n        f.write(src)\n    print('Patched: MinimaxH3LatentUpscalerNode2D NestedTensor → dense')\nelse:\n    print('PATCH ALREADY APPLIED or pattern not found — leaving file unchanged')\nEOF",
     )
     .entrypoint([])  # disable base image entrypoint; we start ComfyUI ourselves
 )
@@ -952,6 +1016,7 @@ class H3Generator:
             "call_id": fut.object_id,
         }
 
+    @_with_failure_marker
     def _run_workflow(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
         """Submit workflow to local ComfyUI, poll history, return video bytes.
 
