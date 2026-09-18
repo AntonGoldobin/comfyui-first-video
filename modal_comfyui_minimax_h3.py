@@ -105,8 +105,9 @@ try:
     _orig_modify = _bc_auth.S3SigV4Auth._modify_request_before_signing
 
     def _upayload_modify(self, request):
-        _orig_modify(self, request)
+        request = _orig_modify(self, request)  # must return — SigV4Auth.sign() passes result to super().sign()
         request.headers["x-amz-content-sha256"] = "UNSIGNED-PAYLOAD"
+        return request
 
     _bc_auth.S3SigV4Auth._modify_request_before_signing = _upayload_modify
 except ImportError:
