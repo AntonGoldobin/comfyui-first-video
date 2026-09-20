@@ -207,8 +207,13 @@ def _write_failure_marker(nonce: str, *, error: str) -> None:
         "failed_at": _time.time(),
     }).encode("utf-8")
     try:
+        # Task #178 follow-up (2026-09-20): use AWS_ENDPOINT_URL (matches
+        # `reelant-s3` Modal Secret keys + the success path's _sigv4_put at
+        # line ~932). Previous S3_ENDPOINT_URL raised KeyError because that
+        # key was never set in the secret — workers polling S3 saw neither
+        # .mp4 nor .failed.json, kept polling up to sweeper timeout.
         status, _resp = _sigv4_put(
-            url=os.environ["S3_ENDPOINT_URL"],
+            url=os.environ["AWS_ENDPOINT_URL"],
             body=body,
             access_key=os.environ["AWS_ACCESS_KEY_ID"],
             secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
