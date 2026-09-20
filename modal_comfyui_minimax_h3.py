@@ -10,7 +10,6 @@ Reuses the proven scaffold from modal_comfyui.py:
   - sombi base image (sombi/comfyui:base-torch2.8.0-cu124)
   - /ComfyUI mount, --output-directory /modal-data/output, ASGI proxy
   - copy_dir_contents from Modal Volume to /ComfyUI/models/
-  - same 600s startup, 1800s timeout, 5s scaledown_window (R.117, 2026-09-01)
   - same 600s startup, 1800s timeout, 300s scaledown_window (R.117 5s, Task F 2026-09-16 → 120s, Task B 2026-09-17 → 300s, Task G 2026-09-17 → 60s + max_containers=1, Task H 2026-09-17 → 300s paired with Task C worker pre-warm)
 
 Differences from modal_comfyui.py:
@@ -470,6 +469,19 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
 #   1. Run workflow via local ComfyUI on :8188 (same container, no HTTP proxy).
 #   2. Explicit volume.commit() before returning bytes — replaces R.137 watcher.
 # =============================================================================
+# Task A (2026-09-16): @modal.concurrent(target_inputs=4, max_inputs=4) lets
+# /api/result (sync FastAPI) serve polls while /api/run is mid-GPU-work on
+# the same H100 container. Without this, sync HTTP requests queue on the
+# container's threadpool until the GPU method returns (~minutes for a real
+# generation) — worker stalls on /api/result polling.
+# Modal Labs production-tested this combo on @modal.cls(enable_memory_snapshot=True)
+# + @modal.enter() — see sglang_snapshot.py / ministral3_inference.py.
+# NOTE: decorator order matters — @app.cls OUTSIDE, @modal.concurrent INSIDE
+# (opposite of standard "wrap outside" intuition). Modal SDK raises
+# InvalidError("Cannot stack @modal.concurrent on top of @app.cls()") if
+# reversed. sglang_snapshot.py and ministral3_inference.py both confirm
+# this order.
+# MEMORY [[modal-container-concurrency-hang-2026-09-16]].
 @app.cls(
     image=image,
     volumes={"/modal-data": h3_models_volume},
@@ -491,6 +503,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     region="us-east",
     gpu="H100",
 )
+@modal.concurrent(target_inputs=4, max_inputs=4)
 class H3Generator:
     @modal.enter(snap=False)  # Task #176: disable snap entirely — no snapshot, full cold-start every idle gap
     def setup(self):
@@ -558,8 +571,17 @@ class H3Generator:
             os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
 
         log.info("Sync model copy (~50 GB / ~3 min)")
+        # ponytail: cold-start RCA — verify whether copy loop re-runs inside setup()
+        # despite @modal.enter(). Snapshots capture FS state from this point,
+        # so the loop SHOULD be skipped on warm starts. If INSTR_COPY END appears on
+        # warm starts, copy is being re-executed (bottleneck confirmed).
+        copy_start_ts = time.monotonic()
+        copy_start_wall = time.time()
+        log.info(f"[INSTR_COPY] model copy START wall={copy_start_wall:.3f} monotonic={copy_start_ts:.3f}")
         for sub in all_subs:
             copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        copy_duration = time.monotonic() - copy_start_ts
+        log.info(f"[INSTR_COPY] model copy END wall={time.time():.3f} duration={copy_duration:.1f}s")
         log.info("Model copy complete")
 
         # Persist output to Modal Volume
@@ -577,17 +599,29 @@ class H3Generator:
         # Root cause: `main.py:239` imports `comfy.model_management`, which at
         # module-load runs `total_vram = get_total_memory(get_torch_device())`.
         # `get_torch_device()` calls `torch.cuda.current_device()` →
-        # `torch._C._cuda_init()`. After a Modal @modal.enter(snap=True)
+        # `torch._C._cuda_init()`. After a Modal @modal.enter()
         # snapshot restore, GPU memory state is NOT in the snapshot (Modal
         # docs explicit). On the first import post-restore, the GPU may not
         # be bound yet → RuntimeError("No CUDA GPUs are available"). ComfyUI
         # crashes BEFORE its HTTP server starts → setup()'s /system_stats
         # poll loops 600× → RuntimeError("ComfyUI startup timeout").
         #
-        # Fix: wrap the eager init in try/except RuntimeError. On failure,
-        # `total_vram = 0`. On Linux (Modal runs Linux), `total_vram` is only
-        # read in a Windows-only VRAM-reservation branch; the only Linux
-        # effect is a slightly different startup log line.
+        # Fix: wrap the eager init in try/except (RuntimeError, KeyError,
+        # TypeError, AttributeError). On failure, `total_vram = 0`. On
+        # Linux (Modal runs Linux), `total_vram` is only read in a
+        # Windows-only VRAM-reservation branch; the only Linux effect is a
+        # slightly different startup log line.
+        #
+        # Task #216d (2026-09-14): broadened from `except RuntimeError` to
+        # `except (RuntimeError, KeyError, TypeError, AttributeError)`. The
+        # original wrap at this consumer site missed KeyError raised
+        # INSIDE `get_total_memory` at line ~403 on
+        # `stats['reserved_bytes.all.current']` when GPU telemetry dict is
+        # missing fields during cold-start snap-restore (Modal app
+        # `comfyui-minimax-h3` crashlooping since v48 / 2026-09-13 10:24,
+        # last known-good v47 = `4ef858e`). TypeError/AttributeError also
+        # covered defensively for adjacent dict-access failures
+        # (None stats, stale device handle, etc.).
         #
         # Idempotent: sentinel comment check skips re-runs. Re-runs on a
         # new ComfyUI version that preserves the line shape will re-patch
@@ -620,10 +654,15 @@ class H3Generator:
                         f"{_indent}    # state — reserved_bytes.all.current key may be missing). Defer both to 0;\n"
                         f"{_indent}    # total_vram is only read in Windows-only VRAM-reservation logic,\n"
                         f"{_indent}    # so on Linux this only affects the startup log line.\n"
+                        f"{_indent}    # Task #216d (2026-09-14): broadened except tuple — get_total_memory\n"
+                        f"{_indent}    # at line ~403 crashes with KeyError on stats['reserved_bytes.all.current']\n"
+                        f"{_indent}    # when GPU telemetry dict is missing fields during cold-start snap-restore.\n"
+                        f"{_indent}    # TypeError/AttributeError also covered defensively for adjacent dict-access\n"
+                        f"{_indent}    # failures (None stats, stale device handle, etc.).\n"
                         f"{_indent}    total_vram = 0\n"
                         f"{_indent}    logging.warning(\n"
-                        f"{_indent}        \"H3_TASK216: deferred CUDA init in comfy.model_management: %s\",\n"
-                        f"{_indent}        _e3_init_err,\n"
+                        f"{_indent}        \"H3_TASK216d: deferred init in comfy.model_management caught %s: %s\",\n"
+                        f"{_indent}        type(_e3_init_err).__name__, _e3_init_err,\n"
                         f"{_indent}    )"
                     )
                     _new_src = _mm_src[:_m.start()] + _replacement + _mm_src[_m.end():]
@@ -678,7 +717,7 @@ class H3Generator:
                         f"{_indent2}try:\n"
                         f"{_indent2}    return torch.device(torch.cuda.current_device())\n"
                         f"{_indent2}except RuntimeError as _e212_init_err:\n"
-                        f"{_indent2}    # Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        f"{_indent2}    # Modal @modal.enter() snapshots CPU+FS but NOT GPU state.\n"
                         f"{_indent2}    # get_torch_device() is called at module load by cuda_malloc_warning(),\n"
                         f"{_indent2}    # BEFORE the previously-patched line 363 ever runs. Fall back to CPU\n"
                         f"{_indent2}    # so ComfyUI import succeeds and the HTTP server can start; the next\n"
@@ -746,7 +785,7 @@ class H3Generator:
                         "\n"
                         "\n"
                         "# H3_TASK216c_torch_cuda_tolerance — DO NOT REMOVE\n"
-                        "# Modal @modal.enter(snap=True) snapshots CPU+FS but NOT GPU state.\n"
+                        "# Modal @modal.enter() snapshots CPU+FS but NOT GPU state.\n"
                         "# After snap-restore, torch.cuda.* can raise RuntimeError(\"No CUDA GPUs ...\").\n"
                         "# Monkey-patch torch.cuda.get_device_properties and torch.cuda.current_device\n"
                         "# to return safe defaults on RuntimeError. Single point of tolerance —\n"
@@ -774,6 +813,15 @@ class H3Generator:
                         "                minor = 0\n"
                         "                multi_processor_count = 132\n"
                         "                total_memory = 80 * 1024 * 1024 * 1024\n"
+                        "                # H3_TASK216e — .name added so torch.cuda.get_device_name()\n"
+                        "                # (which calls get_device_properties(device).name) stops\n"
+                        "                # crashing on snap-restore cold-start at\n"
+                        "                # comfy/model_management.py:685 cuda_malloc_warning().\n"
+                        "                # Defensive siblings for likely-next-access sites.\n"
+                        "                name = \"NVIDIA H100-SXM5-80GB\"\n"
+                        "                is_integrated = 0\n"
+                        "                is_multi_gpu_board = 0\n"
+                        "                L2_cache_size = 50 * 1024 * 1024  # 50 MB\n"
                         "            return _FakeProps()\n"
                         "    _h3_torch_216c.cuda.get_device_properties = _h3_safe_get_dev_props_216c\n"
                         "    _h3_orig_cur_dev_216c = _h3_torch_216c.cuda.current_device\n"
