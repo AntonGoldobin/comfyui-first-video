@@ -497,7 +497,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     enable_memory_snapshot=False,  # Task #176 (2026-09-18): snap=True caused snap-restore race that broke ComfyUI startup via _FakeProps.name AttributeError (and prior KeyError on memory_stats). H3_TASK216 patches (a/b/c) remain as dead defense-in-depth. Cold-start ~22s→~44s, acceptable since min_containers=0 + scaledown_window=300 make cold-starts rare.
     min_containers=0,
     scaledown_window=300,  # Task H (2026-09-17): 60→300 — Task C worker pre-warm on /api/run guarantees container alive at submit time, so 60s scaledown_window (Task G) was overkill. Bump back to 300s for safety margin: covers burst pattern (Gen 1 → 7+ min polling → Gen 2) where worker is busy on Gen 1 result fetch when Gen 2 pre-warm fires. With Task C + max_containers=1 + scaledown_window=300: container cold-starts ONCE per idle gap (≥300s = 5 min), then reused across burst.
-    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=4, max_inputs=4) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time.
+    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=1, max_inputs=1) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time. OOM follow-up (2026-09-20): 4→1 because worker is BullMQ-serial (concurrency:1), so Modal-side 4-way concurrent would have stacked overlapping H3 22B UNet activations and OOMed at node 151 sampler on 3rd consecutive gen.
     # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
     # MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
     buffer_containers=0,
@@ -508,7 +508,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     region="us-east",
     gpu="H100",
 )
-@modal.concurrent(target_inputs=4, max_inputs=4)
+@modal.concurrent(target_inputs=1, max_inputs=1)  # OOM follow-up 2026-09-20: 4→1
 class H3Generator:
     @modal.enter(snap=False)  # Task #176: disable snap entirely — no snapshot, full cold-start every idle gap
     def setup(self):
@@ -899,6 +899,13 @@ class H3Generator:
         in the api_result endpoint. Worker polls api_result with the
         call_id from the spawn response.
 
+        OOM follow-up (2026-09-20): torch.cuda.empty_cache() + gc.collect()
+        at entry. Without this, consecutive requests on the same container
+        accumulate cached tensors — H3 22B UNet + HMNSFW/Turbo LoRA + audio
+        VAE ran OOM at node 151 SamplerCustomAdvanced for 3rd gen on the
+        same container (800×800×90 after 2 prior gens). Modal doesn't
+        auto-release between concurrent inputs.
+
         Idempotency note: R.119 used modal.Dict for nonce-keyed atomic claim
         + result caching. Task #218 removes Dict entirely — concurrent submits
         with the same nonce are the WORKER's responsibility (worker keeps
@@ -908,6 +915,22 @@ class H3Generator:
         the same result once available.
         """
         log.info(f"generate nonce={nonce}: starting (call_id-based)")
+        # OOM follow-up (2026-09-20): release cached CUDA memory + GC before
+        # _run_workflow loads H3 22B UNet + LoRAs. Without this, 3rd consecutive
+        # gen on the same container OOMed at node 151 sampler.
+        try:
+            import torch
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            log.info(f"generate nonce={nonce}: pre-flight CUDA cleanup done "
+                     f"(allocated={torch.cuda.memory_allocated()/1e9:.1f}GB, "
+                     f"reserved={torch.cuda.memory_reserved()/1e9:.1f}GB)")
+        except Exception as _oom_cleanup_err:
+            log.warning(f"generate nonce={nonce}: pre-flight CUDA cleanup "
+                        f"best-effort failed: {_oom_cleanup_err!r}")
         t0 = time.time()
         # Method-scope boto3 import (matching FastAPI/httpx convention at L36+).
         # Module-scope import breaks `modal deploy` local introspection —
@@ -951,6 +974,30 @@ class H3Generator:
             f"generate nonce={nonce} S3 PUT OK status={status} "
             f"s3://{os.environ['S3_BUCKET']}/{s3_key} ({len(result_bytes)} bytes)"
         )
+
+        # OOM follow-up (2026-09-20): release cached CUDA memory + GC after
+        # workflow + S3 PUT. Worker is BullMQ-serial (concurrency:1), so the
+        # Modal container will be reused for the NEXT gen — and that next gen
+        # gets a clean GPU instead of inheriting this gen's cached tensors.
+        # Without this, 3rd consecutive gen on the same container OOMed at
+        # node 151 SamplerCustomAdvanced (H3 22B UNet activations).
+        try:
+            import torch
+            import gc as _gc_post
+            _gc_post.collect()
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            log.info(
+                f"generate nonce={nonce}: post-flight CUDA cleanup done "
+                f"(allocated={torch.cuda.memory_allocated()/1e9:.1f}GB, "
+                f"reserved={torch.cuda.memory_reserved()/1e9:.1f}GB)"
+            )
+        except Exception as _oom_post_err:
+            log.warning(
+                f"generate nonce={nonce}: post-flight CUDA cleanup "
+                f"best-effort failed: {_oom_post_err!r}"
+            )
 
         return result_bytes
 
