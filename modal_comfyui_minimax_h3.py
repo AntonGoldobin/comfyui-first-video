@@ -207,8 +207,13 @@ def _write_failure_marker(nonce: str, *, error: str) -> None:
         "failed_at": _time.time(),
     }).encode("utf-8")
     try:
+        # Task #178 follow-up (2026-09-20): use AWS_ENDPOINT_URL (matches
+        # `reelant-s3` Modal Secret keys + the success path's _sigv4_put at
+        # line ~932). Previous S3_ENDPOINT_URL raised KeyError because that
+        # key was never set in the secret — workers polling S3 saw neither
+        # .mp4 nor .failed.json, kept polling up to sweeper timeout.
         status, _resp = _sigv4_put(
-            url=os.environ["S3_ENDPOINT_URL"],
+            url=os.environ["AWS_ENDPOINT_URL"],
             body=body,
             access_key=os.environ["AWS_ACCESS_KEY_ID"],
             secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
@@ -363,12 +368,17 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
         os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
 
     # ---- H3 model registry — VERIFIED against Comfy-Org/MiniMax-H3 2026-08-20 ----
+    # R.185 (2026-09-22): fl2va → ref2va swap for persistent face/identity preservation.
+    # ref2va is the matching checkpoint for MiniMaxH3ReferenceToVideo (vs fl2va for
+    # MiniMaxH3ImageToVideo). ref2va keeps identity stable across frames via multi-image
+    # packing; fl2va only sees first+last frames and forgets identity in between.
+    # Acc-8Step LoRA for ref2va from Kijai replaces the fl2v-turbo LoRA (not compatible).
     H3_FILES = [
         # (relative_path_under_models/, source_url, expected_min_bytes)
         (
-            "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            14_000_000_000,
+            "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            20_000_000_000,
         ),
         (
             "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
@@ -386,9 +396,9 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
             200_000_000,
         ),
         (
-            "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            100_000_000,
+            "loras/MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors",
+            "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors",
+            1_700_000_000,
         ),
         # Mystic XXX — community style LoRA for H3 (lynaNSFW/mysticxxx_MM_H3, V4 pruned)
         # strength_model 0.5-0.9; stacks after Turbo. See lynaNSFW HF repo for trigger guidance.
@@ -492,7 +502,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     enable_memory_snapshot=False,  # Task #176 (2026-09-18): snap=True caused snap-restore race that broke ComfyUI startup via _FakeProps.name AttributeError (and prior KeyError on memory_stats). H3_TASK216 patches (a/b/c) remain as dead defense-in-depth. Cold-start ~22s→~44s, acceptable since min_containers=0 + scaledown_window=300 make cold-starts rare.
     min_containers=0,
     scaledown_window=300,  # Task H (2026-09-17): 60→300 — Task C worker pre-warm on /api/run guarantees container alive at submit time, so 60s scaledown_window (Task G) was overkill. Bump back to 300s for safety margin: covers burst pattern (Gen 1 → 7+ min polling → Gen 2) where worker is busy on Gen 1 result fetch when Gen 2 pre-warm fires. With Task C + max_containers=1 + scaledown_window=300: container cold-starts ONCE per idle gap (≥300s = 5 min), then reused across burst.
-    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=4, max_inputs=4) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time.
+    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=1, max_inputs=1) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time. OOM follow-up (2026-09-20): 4→1 because worker is BullMQ-serial (concurrency:1), so Modal-side 4-way concurrent would have stacked overlapping H3 22B UNet activations and OOMed at node 151 sampler on 3rd consecutive gen.
     # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
     # MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
     buffer_containers=0,
@@ -503,7 +513,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     region="us-east",
     gpu="H100",
 )
-@modal.concurrent(target_inputs=4, max_inputs=4)
+@modal.concurrent(target_inputs=1, max_inputs=1)  # OOM follow-up 2026-09-20: 4→1
 class H3Generator:
     @modal.enter(snap=False)  # Task #176: disable snap entirely — no snapshot, full cold-start every idle gap
     def setup(self):
@@ -894,6 +904,13 @@ class H3Generator:
         in the api_result endpoint. Worker polls api_result with the
         call_id from the spawn response.
 
+        OOM follow-up (2026-09-20): torch.cuda.empty_cache() + gc.collect()
+        at entry. Without this, consecutive requests on the same container
+        accumulate cached tensors — H3 22B UNet + HMNSFW/Turbo LoRA + audio
+        VAE ran OOM at node 151 SamplerCustomAdvanced for 3rd gen on the
+        same container (800×800×90 after 2 prior gens). Modal doesn't
+        auto-release between concurrent inputs.
+
         Idempotency note: R.119 used modal.Dict for nonce-keyed atomic claim
         + result caching. Task #218 removes Dict entirely — concurrent submits
         with the same nonce are the WORKER's responsibility (worker keeps
@@ -903,6 +920,22 @@ class H3Generator:
         the same result once available.
         """
         log.info(f"generate nonce={nonce}: starting (call_id-based)")
+        # OOM follow-up (2026-09-20): release cached CUDA memory + GC before
+        # _run_workflow loads H3 22B UNet + LoRAs. Without this, 3rd consecutive
+        # gen on the same container OOMed at node 151 sampler.
+        try:
+            import torch
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            log.info(f"generate nonce={nonce}: pre-flight CUDA cleanup done "
+                     f"(allocated={torch.cuda.memory_allocated()/1e9:.1f}GB, "
+                     f"reserved={torch.cuda.memory_reserved()/1e9:.1f}GB)")
+        except Exception as _oom_cleanup_err:
+            log.warning(f"generate nonce={nonce}: pre-flight CUDA cleanup "
+                        f"best-effort failed: {_oom_cleanup_err!r}")
         t0 = time.time()
         # Method-scope boto3 import (matching FastAPI/httpx convention at L36+).
         # Module-scope import breaks `modal deploy` local introspection —
@@ -946,6 +979,30 @@ class H3Generator:
             f"generate nonce={nonce} S3 PUT OK status={status} "
             f"s3://{os.environ['S3_BUCKET']}/{s3_key} ({len(result_bytes)} bytes)"
         )
+
+        # OOM follow-up (2026-09-20): release cached CUDA memory + GC after
+        # workflow + S3 PUT. Worker is BullMQ-serial (concurrency:1), so the
+        # Modal container will be reused for the NEXT gen — and that next gen
+        # gets a clean GPU instead of inheriting this gen's cached tensors.
+        # Without this, 3rd consecutive gen on the same container OOMed at
+        # node 151 SamplerCustomAdvanced (H3 22B UNet activations).
+        try:
+            import torch
+            import gc as _gc_post
+            _gc_post.collect()
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+            log.info(
+                f"generate nonce={nonce}: post-flight CUDA cleanup done "
+                f"(allocated={torch.cuda.memory_allocated()/1e9:.1f}GB, "
+                f"reserved={torch.cuda.memory_reserved()/1e9:.1f}GB)"
+            )
+        except Exception as _oom_post_err:
+            log.warning(
+                f"generate nonce={nonce}: post-flight CUDA cleanup "
+                f"best-effort failed: {_oom_post_err!r}"
+            )
 
         return result_bytes
 
