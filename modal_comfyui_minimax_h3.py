@@ -368,12 +368,17 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
         os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
 
     # ---- H3 model registry — VERIFIED against Comfy-Org/MiniMax-H3 2026-08-20 ----
+    # R.185 (2026-09-22): fl2va → ref2va swap for persistent face/identity preservation.
+    # ref2va is the matching checkpoint for MiniMaxH3ReferenceToVideo (vs fl2va for
+    # MiniMaxH3ImageToVideo). ref2va keeps identity stable across frames via multi-image
+    # packing; fl2va only sees first+last frames and forgets identity in between.
+    # Acc-8Step LoRA for ref2va from Kijai replaces the fl2v-turbo LoRA (not compatible).
     H3_FILES = [
         # (relative_path_under_models/, source_url, expected_min_bytes)
         (
-            "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            14_000_000_000,
+            "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            20_000_000_000,
         ),
         (
             "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
@@ -391,9 +396,9 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
             200_000_000,
         ),
         (
-            "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            100_000_000,
+            "loras/MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors",
+            "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors",
+            1_700_000_000,
         ),
         # Mystic XXX — community style LoRA for H3 (lynaNSFW/mysticxxx_MM_H3, V4 pruned)
         # strength_model 0.5-0.9; stacks after Turbo. See lynaNSFW HF repo for trigger guidance.
