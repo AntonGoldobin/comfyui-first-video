@@ -152,6 +152,16 @@ WAN22_FILES = [
         "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
         635_000_000,
     ),
+    # ─── Style B (RIFE 60 FPS): RIFE VFI model, Task #15 (2026-09-27) ───
+    # Fannovel16/ComfyUI-Frame-Interpolation vfi_utils.get_ckpt_container_path
+    # returns `<custom_node>/ckpts/rife/` (NOT /ComfyUI/models/<sub>/). The
+    # setup_wan22_models worker + the @modal.enter()'s copy loop stages the file
+    # there explicitly below.
+    (
+        "rife/rife49.pth",
+        "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/rife49.pth",
+        21_000_000,
+    ),
 ]
 
 
@@ -435,6 +445,23 @@ class WanGenerator:
         log.info(f"[INSTR_COPY] model copy START wall={copy_start_wall:.3f} monotonic={copy_start_ts:.3f}")
         for sub in all_subs:
             copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        # Task #15 (2026-09-27): Stage rife49.pth into ComfyUI-Frame-Interpolation
+        # custom_node's own ckpts/rife/ folder. The custom_node reads from
+        # `<custom_node>/ckpts/rife/rife49.pth` (Fannovel16/vfi_utils.py — relative
+        # path to vfi_utils.py). NOT /ComfyUI/models/other/. Pre-bundle keeps RIFE
+        # working at request-time without needing GitHub firewall egress.
+        rife_ckpt_src = "/modal-data/models/rife/rife49.pth"
+        rife_ckpt_dst_dir = "/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife"
+        os.makedirs(rife_ckpt_dst_dir, exist_ok=True)
+        rife_ckpt_dst = f"{rife_ckpt_dst_dir}/rife49.pth"
+        if os.path.exists(rife_ckpt_src):
+            if not os.path.exists(rife_ckpt_dst) or os.path.getsize(rife_ckpt_dst) != os.path.getsize(rife_ckpt_src):
+                shutil.copy2(rife_ckpt_src, rife_ckpt_dst)
+                log.info(f"[INSTR_RIFE] staged {rife_ckpt_src} -> {rife_ckpt_dst}")
+            else:
+                log.info(f"[INSTR_RIFE] already staged at {rife_ckpt_dst}")
+        else:
+            log.warning(f"[INSTR_RIFE] NOT FOUND: {rife_ckpt_src} — RIFE VFI may fall back to GitHub download at request-time")
         copy_duration = time.monotonic() - copy_start_ts
         log.info(f"[INSTR_COPY] model copy END wall={time.time():.3f} duration={copy_duration:.1f}s")
         log.info("Model copy complete")
