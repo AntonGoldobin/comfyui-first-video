@@ -842,18 +842,20 @@ class WanGenerator:
             log.warning(f"model_management.py: WAN_TASK216c patcher failed: {_patch_err3}")
 
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
-        # Task #63: --use-sage-attention activates SageAttention 2.2.0 SM90 FP8 kernel
-        # for H100. Expected ~1.5-2.5x attention speedup on Wan 2.2 I2V (research:
-        # ~/.orchestrator/handover/reelant/2026-09-28_speedup_research/SPEEDUP-RESEARCH.md).
-        # SageAttention is installed at image-build time (line 88-89). If the flag
-        # is rejected (e.g. ComfyUI version too old), ComfyUI logs and falls back
-        # to default attention — no crash.
+        # Task #85: --use-sage-attention flag removed. Was enabled in Task #63 (commit
+        # 319393f) and verified on cold container (90.7s Modal internal, 1.45x speedup
+        # vs 131.7s baseline) — but Task #84 E2E found 33% failure rate on warm
+        # containers (KSamplerAdvanced node 311 failures, root-caused to Sage kernel
+        # CUDA state corruption). Upstream issues open: thu-ml/SageAttention #392
+        # (CUDA-graph replay) + ComfyUI #6125 (--use-sage-attention CUDA illegal
+        # memory access). Sage kernel remains installed at image-build (line 88-89);
+        # re-enabling is a one-line change once those close. Meanwhile we accept
+        # the ~131.7s baseline for reliability. Plan successor: Task #65 (TeaCache).
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
         self._proc = subprocess.Popen(
             [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
              "--port", "8188", "--disable-auto-launch", "--gpu-only",
-             "--use-sage-attention",
              "--output-directory", "/modal-data/output"],
             stdout=log_file, stderr=subprocess.STDOUT,
         )
