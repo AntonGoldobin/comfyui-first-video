@@ -842,11 +842,18 @@ class WanGenerator:
             log.warning(f"model_management.py: WAN_TASK216c patcher failed: {_patch_err3}")
 
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
+        # Task #63: --use-sage-attention activates SageAttention 2.2.0 SM90 FP8 kernel
+        # for H100. Expected ~1.5-2.5x attention speedup on Wan 2.2 I2V (research:
+        # ~/.orchestrator/handover/reelant/2026-09-28_speedup_research/SPEEDUP-RESEARCH.md).
+        # SageAttention is installed at image-build time (line 88-89). If the flag
+        # is rejected (e.g. ComfyUI version too old), ComfyUI logs and falls back
+        # to default attention — no crash.
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
         self._proc = subprocess.Popen(
             [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
              "--port", "8188", "--disable-auto-launch", "--gpu-only",
+             "--use-sage-attention",
              "--output-directory", "/modal-data/output"],
             stdout=log_file, stderr=subprocess.STDOUT,
         )
