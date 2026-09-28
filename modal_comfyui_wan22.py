@@ -427,9 +427,15 @@ class WanGenerator:
                 log.info(f"Copying {src} → {dst}")
                 shutil.copy2(src, dst)
 
+        # ponytail: Task #56 (2026-09-28) — clip_vision was missing from the
+        # copy loop, so comfy-core CLIPVisionLoader (#321) scanned an empty
+        # /ComfyUI/models/clip_vision/ dir and rejected the workflow with
+        # "clip_name: 'clip_vision_h.safetensors' not in []". File was already
+        # on the Modal volume (models/clip_vision/) — just needed the copy.
         all_subs = (
             "diffusion_models", "text_encoders", "vae",
             "loras", "latent_upscale_models", "checkpoints",
+            "clip_vision",
         )
         for sub in all_subs:
             os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
@@ -462,6 +468,96 @@ class WanGenerator:
                 log.info(f"[INSTR_RIFE] already staged at {rife_ckpt_dst}")
         else:
             log.warning(f"[INSTR_RIFE] NOT FOUND: {rife_ckpt_src} — RIFE VFI may fall back to GitHub download at request-time")
+
+        # Task #29 (2026-09-27): PATCH RIFE VFI custom_node line 238 — fix CPU/CUDA
+        # tensor mismatch in torch.cat(output_frames). Root cause: RIFE accumulates
+        # intermediate frames on CPU during inference (likely from clear_cache_after_n_frames
+        # sync flush). Final torch.cat then errors with "tensors is on cpu, different from
+        # other tensors on cuda:0". Fix: normalize device before cat. This is a 1-line
+        # patch on the custom_node file baked into the Modal image.
+        rife_init_py = "/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/vfi_models/rife/__init__.py"
+        if os.path.exists(rife_init_py):
+            with open(rife_init_py, "r") as _f:
+                _rife_src = _f.read()
+            _marker = "# RIFE_PATCH_2026_09_27 device-normalize before cat"
+            _dbg_marker = "# INSTR_RIFE_DEBUG: runtime probe"
+            _patched_any = False
+            if _marker not in _rife_src:
+                # Insert before the torch.cat call. The original line is:
+                #   out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)
+                _old = "out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)"
+                _new = (
+                    f"{_marker}\n"
+                    "        if len(output_frames) > 0:\n"
+                    "            _device = output_frames[0].device\n"
+                    "            output_frames = [f.to(_device) if f.device != _device else f for f in output_frames]\n"
+                    "        out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)"
+                )
+                if _old in _rife_src:
+                    _rife_src = _rife_src.replace(_old, _new, 1)
+                    log.info(f"[INSTR_RIFE_PATCH] applied device-normalize patch to {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
+
+            if _dbg_marker not in _rife_src:
+                # Task #35 (2026-09-27): inject a [INSTR_RIFE_DEBUG] print()
+                # right after the first executable line inside vfi() so we can
+                # see in Modal logs exactly what multiplier + frames.shape
+                # reach RIFE at request time. Without this we cannot tell
+                # whether multiplier=4 from DB arrives intact or is silently
+                # coerced (e.g. coerced to int(1) by some upstream wrapper).
+                _dbg_old = "        from .rife_arch import IFNet"
+                _dbg_new = (
+                    "        from .rife_arch import IFNet\n"
+                    f"{_dbg_marker} — confirms multiplier reaches vfi() body.\n"
+                    "        import sys as _dbg_sys, torch as _dbg_torch\n"
+                    "        _dbg_sys.stdout.write(\n"
+                    "            f\"[INSTR_RIFE_DEBUG] multiplier={multiplier!r} \"\n"
+                    "            f\"type={type(multiplier).__name__} \"\n"
+                    "            f\"ckpt_name={ckpt_name!r} \"\n"
+                    "            f\"frames.shape={tuple(frames.shape) if hasattr(frames,'shape') else 'NA'} \"\n"
+                    "            f\"frames.device={getattr(frames,'device','NA')} \"\n"
+                    "            f\"dtype={dtype!r}\\n\"\n"
+                    "        )\n"
+                    "        _dbg_sys.stdout.flush()"
+                )
+                if _dbg_old in _rife_src:
+                    _rife_src = _rife_src.replace(_dbg_old, _dbg_new, 1)
+                    log.info(f"[INSTR_RIFE_DEBUG_PATCH] applied runtime-probe print to {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_DEBUG_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
+
+            # Persist whatever we patched to disk (idempotent — both markers above
+            # ensure re-runs are no-ops).
+            with open(rife_init_py, "w") as _f:
+                _f.write(_rife_src)
+            log.info(f"[INSTR_RIFE] patch phase complete for {rife_init_py}")
+
+            # Task #35 (2026-09-27): force module reload so ComfyUI sees the
+            # patched bytes. Root cause: if `_run_workflow` ran BEFORE this
+            # @enter() block completed (e.g. warm container reused), Python
+            # already imported vfi_models.rife and cached `_model_cache` +
+            # the `RIFE_VFI` class reference. Our file-on-disk patch is then
+            # dead code on the next generate() call. `importlib.reload()` +
+            # clearing the LRU cache invalidates the bound class. The 1-line
+            # `try/except` keeps the warm path cheap if the module isn't yet
+            # imported.
+            try:
+                import importlib
+                import sys as _sys
+                _sys.path.insert(0, "/ComfyUI/custom_nodes")
+                import vfi_models.rife as _rife_mod
+                importlib.reload(_rife_mod)
+                # Re-publish on the parent package registry so ComfyUI's
+                # NODE_CLASS_MAPPINGS lookup hits the freshly reloaded class.
+                import vfi_models as _vm
+                _vm.rife = _rife_mod
+                log.info(f"[INSTR_RIFE_RELOAD] forced module reload of {rife_init_py}")
+            except Exception as _reload_err:
+                log.warning(f"[INSTR_RIFE_RELOAD] skipped (module not yet importable): {_reload_err}")
+        else:
+            log.warning(f"[INSTR_RIFE_PATCH] custom_node not found at {rife_init_py} — RIFE may not be installed in this image")
+
         copy_duration = time.monotonic() - copy_start_ts
         log.info(f"[INSTR_COPY] model copy END wall={time.time():.3f} duration={copy_duration:.1f}s")
         log.info("Model copy complete")
@@ -1130,6 +1226,28 @@ class WanGenerator:
             workflow_json = wj2
         except Exception as _loadimg_err:
             log.warning(f"_run_workflow: LoadImage base64 decode skipped — {_loadimg_err}")
+
+        # Task #38 (2026-09-27): log the actual prompt body fields that reach
+        # ComfyUI for nodes 303 (RIFE VFI) + 94 (VHS_VideoCombine). After two
+        # generation cycles showing 81 frames at 16 FPS despite RIFE patched
+        # and DB correct, RIFE's vfi() body never executed (zero [INSTR_RIFE_DEBUG]
+        # logs in 88acf974 run). Need to confirm whether worker sends the
+        # expected multiplier=4 + frame_rate=60, or whether ComfyUI rewrites
+        # the body server-side. Single log line — no side-effects.
+        try:
+            _wf = workflow_json if isinstance(workflow_json, dict) else _json.loads(workflow_json)
+            _n303 = (_wf.get("303") or {}).get("inputs", {}) or {}
+            _n94 = (_wf.get("94") or {}).get("inputs", {}) or {}
+            log.info(
+                f"[INSTR_PROMPT_DEBUG] node303.multiplier={_n303.get('multiplier')!r} "
+                f"node303.frames={_n303.get('frames')!r} "
+                f"node303.dtype={_n303.get('dtype')!r} "
+                f"node94.images={_n94.get('images')!r} "
+                f"node94.frame_rate={_n94.get('frame_rate')!r} "
+                f"workflow_node_count={len(_wf)}"
+            )
+        except Exception as _prompt_dbg_err:
+            log.warning(f"[INSTR_PROMPT_DEBUG] failed: {_prompt_dbg_err}")
 
         body = {"prompt": workflow_json, "client_id": client_id}
         r = _httpx.post(
