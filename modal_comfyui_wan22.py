@@ -140,6 +140,23 @@ WAN22_FILES = [
         "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
         14_000_000_000,
     ),
+    # ─── Reference-clone A/B test (Task #60, 2026-09-28) ─────────────
+    # fp16 variants of Wan 2.2 I2V diffusion models (same Wan 2.2 weights,
+    # uncompressed). User's reference workflow (handover/reelant/2026-09-26_wan22_split/wan22-hearmeman-60fps.workflow.json,
+    # 35 nodes) uses fp16; our current Style B uses fp8_scaled (smaller,
+    # slightly lossy). New style 'wan22-hearmeman-60fps-ref' will switch
+    # UNETLoader to these fp16 files via the workflow JSON. The copy loop
+    # already picks up everything under /modal-data/models/diffusion_models/.
+    (
+        "diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
+        28_000_000_000,
+    ),
+    (
+        "diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
+        28_000_000_000,
+    ),
     # lightx2v 4-step distill LoRAs for Wan 2.2 I2V (high + low noise).
     # Repo: lightx2v/Wan2.2-Distill-Loras (NOT Wan2.2-I2V-A14B-Diffusers-distill-LoRA — 404).
     (
