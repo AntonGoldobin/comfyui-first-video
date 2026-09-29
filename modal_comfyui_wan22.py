@@ -870,14 +870,23 @@ class WanGenerator:
         # containers (KSamplerAdvanced node 311 failures, root-caused to Sage kernel
         # CUDA state corruption). Upstream issues open: thu-ml/SageAttention #392
         # (CUDA-graph replay) + ComfyUI #6125 (--use-sage-attention CUDA illegal
-        # memory access). Sage kernel remains installed at image-build (line 88-89);
+        # memory access). Sage kernel remains installed at image-build (line 110);
         # re-enabling is a one-line change once those close. Meanwhile we accept
         # the ~131.7s baseline for reliability. Plan successor: Task #65 (TeaCache).
+        # Task #92 (2026-09-29): --cache-none added. Disables ComfyUI's node output
+        # caching (VAE decode, CLIP, LoraLoader, etc.). Fixes warm-container GPU
+        # OOM at KSamplerAdvanced node 311 (Task #91 trial 2 exposed it) — cached
+        # tensors from prior gen collided with new KSampler allocation (~28GB
+        # dual-UNet + cached nodes exceeded H100 80GB ceiling). Trade-off: gen 1
+        # is slower because VAE/CLIP re-encode every call (instead of cached). But
+        # the alternative is 33-100% warm-fail rate. Acceptable since most real
+        # traffic is cold-after-idle (Modal scales down containers after ~5min).
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
         self._proc = subprocess.Popen(
             [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
              "--port", "8188", "--disable-auto-launch", "--gpu-only",
+             "--cache-none",
              "--output-directory", "/modal-data/output"],
             stdout=log_file, stderr=subprocess.STDOUT,
         )
