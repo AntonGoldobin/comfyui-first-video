@@ -99,10 +99,15 @@ image = (
         "done",
         "pip install --no-cache-dir opencv-python imageio_ffmpeg",
         "pip install --no-cache-dir fastapi httpx 'starlette>=0.36' boto3",
-        "TORCH_CUDA_ARCH_LIST='9.0+PTX' pip install --no-cache-dir --break-system-packages "
-        "--no-build-isolation "
-        "git+https://github.com/thu-ml/SageAttention.git 2>&1 | tail -10 "
-        "|| echo 'WARN: sageattention install failed — falling back to default attention'",
+        # Task #91 (2026-09-29): switch SageAttention from thu-ml main (2.2.0+) to
+        # pip-released 1.0.6. Same kernel family, but prebuilt wheel (no JIT), no
+        # build isolation, no TORCH_CUDA_ARCH_LIST. Same launch flag works
+        # (--use-sage-attention). Pattern from customWF2026/modal_comfydeploy.
+        # NOTE: SageAttention flag is currently DISABLED in launch (Task #85) due
+        # to warm-container CUDA state corruption; kernel is installed for future
+        # re-enable (single flag flip). Task #85b re-enable attempt FAILED at 3rd
+        # warm gen (KSamplerAdvanced node 311).
+        "pip install --no-cache-dir --break-system-packages sageattention==1.0.6",
         "pip install --no-cache-dir --break-system-packages transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
     )
     .entrypoint([])
