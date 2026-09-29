@@ -75,6 +75,23 @@ image = (
         "git clone --depth=1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation",
         "git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
         "git clone --depth=1 https://github.com/yolain/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-Easy-Use",
+        # Task #65 (2026-09-29): TeaCache — block-output caching, different mechanism
+        # from SageAttention (no SDPA kernel swap, so no warm-container CUDA state
+        # corruption). Expected 1.6-1.9x speedup vs fp8 baseline (131.7s → ~70-85s).
+        #
+        # Why welltop-cn instead of kijai WanVideoEasyCache: Style B workflow uses
+        # comfy-core native WanImageToVideo + KSamplerAdvanced, NOT kijai WanVideoSampler.
+        # kijai's WanVideoTeaCache/WanVideoEasyCache hook via cache_args into
+        # WanVideoSampler only — they don't apply here.
+        #
+        # Known risks for this path:
+        #   1. welltop-cn last commit 2025-07-12 (stale, but functional)
+        #   2. Wan 2.2 tuning absent (Wan 2.1 coefficients only). Threshold scale
+        #      is 10x different in published table — start at rel_l1_thresh=0.20
+        #      for Wan 2.2 (conservative, identity first).
+        #   3. Warm-container state may not reset between gens (similar to kijai
+        #      Issue #371) — 3-trial E2E (1 cold + 2 warm) MUST verify quality.
+        "git clone --depth=1 https://github.com/welltop-cn/ComfyUI-TeaCache /ComfyUI/custom_nodes/ComfyUI-TeaCache",
     )
     .run_commands(
         "for r in /ComfyUI/custom_nodes/*/requirements.txt; do "
