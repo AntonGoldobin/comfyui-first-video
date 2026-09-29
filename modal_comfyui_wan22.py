@@ -842,20 +842,21 @@ class WanGenerator:
             log.warning(f"model_management.py: WAN_TASK216c patcher failed: {_patch_err3}")
 
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
-        # Task #85: --use-sage-attention flag removed. Was enabled in Task #63 (commit
-        # 319393f) and verified on cold container (90.7s Modal internal, 1.45x speedup
-        # vs 131.7s baseline) — but Task #84 E2E found 33% failure rate on warm
-        # containers (KSamplerAdvanced node 311 failures, root-caused to Sage kernel
-        # CUDA state corruption). Upstream issues open: thu-ml/SageAttention #392
-        # (CUDA-graph replay) + ComfyUI #6125 (--use-sage-attention CUDA illegal
-        # memory access). Sage kernel remains installed at image-build (line 88-89);
-        # re-enabling is a one-line change once those close. Meanwhile we accept
-        # the ~131.7s baseline for reliability. Plan successor: Task #65 (TeaCache).
+        # Task #85b: --use-sage-attention flag RE-ENABLED on top of Task #85 disable.
+        # Task #85 (commit 0ac9069) disabled sage because Task #84 E2E showed 33%
+        # warm-container failure rate (KSamplerAdvanced node 311, thu-ml/CUDA state
+        # corruption). Task #85b hypothesis: aggressive post-flight cleanup
+        # (`torch.cuda.synchronize()` BEFORE `empty_cache()`) releases Sage CUDA
+        # state between gens in the same container. If 3-trial E2E (1 cold + 2
+        # warm back-to-back) passes, sage ships back at 1.45x speedup.
+        # If it fails: revert to Task #85 baseline (drop this line) and move to
+        # Task #65 (TeaCache).
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
         self._proc = subprocess.Popen(
             [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
              "--port", "8188", "--disable-auto-launch", "--gpu-only",
+             "--use-sage-attention",
              "--output-directory", "/modal-data/output"],
             stdout=log_file, stderr=subprocess.STDOUT,
         )
@@ -1019,16 +1020,27 @@ class WanGenerator:
         # gets a clean GPU instead of inheriting this gen's cached tensors.
         # Without this, 3rd consecutive gen on the same container OOMed at
         # node 151 SamplerCustomAdvanced (Wan 22B UNet activations).
+        #
+        # Task #85b: torch.cuda.synchronize() BEFORE empty_cache() — force GPU
+        # work to drain before releasing memory. Hypothesis: SageAttention
+        # (thu-ml/SageAttention #392) leaks CUDA state on warm containers when
+        # async kernels are still pending; synchronize() ensures the cleanup
+        # captures a fully-idle GPU. If 3-trial E2E (1 cold + 2 warm
+        # back-to-back) shows sage-at-130s without KSamplerAdvanced failure,
+        # sage ships at 1.45x. If it still fails, the bug is upstream and we
+        # revert the flag.
         try:
             import torch
             import gc as _gc_post
+            torch.cuda.synchronize()  # Task #85b: force GPU idle before cleanup
             _gc_post.collect()
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
             log.info(
                 f"generate nonce={nonce}: post-flight CUDA cleanup done "
-                f"(allocated={torch.cuda.memory_allocated()/1e9:.1f}GB, "
+                f"(sync + gc + empty_cache + ipc_collect; "
+                f"allocated={torch.cuda.memory_allocated()/1e9:.1f}GB, "
                 f"reserved={torch.cuda.memory_reserved()/1e9:.1f}GB)"
             )
         except Exception as _oom_post_err:
