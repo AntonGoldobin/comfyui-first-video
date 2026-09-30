@@ -1,104 +1,260 @@
 """
-modal_comfyui_minimax_h3.py — Modal.com deployment of ComfyUI for MiniMax-H3.
+modal_comfyui_wan22.py — Modal.com deployment of ComfyUI for Wan 2.1 + Phantom + Wan 2.2 I2V.
 
-A SEPARATE Modal app from comfyui-ltx-video so:
-  - LTX-2 endpoint stays untouched (no risk to the working production pipeline)
-  - H3 models live on their own volume (don't share / fill LTX-2's volume)
-  - Independent scaling (H3 is 22B params — slower cold-start, different profile)
+ACTIVE: 2026-09-27 — Style B (wan22-hearmeman-60fps) shipped alongside Style A.
 
-Reuses the proven scaffold from modal_comfyui.py:
+A SEPARATE Modal app from comfyui-minimax-h3 so:
+  - H3 endpoint stays untouched (no risk to existing production pipeline)
+  - Wan models live on their own volume (don't share / fill H3's volume)
+  - Independent scaling (Wan 14B has different VRAM/cold-start profile)
+
+Mirrors the proven scaffold from modal_comfyui_minimax_h3.py:
   - sombi base image (sombi/comfyui:base-torch2.8.0-cu124)
-  - /ComfyUI mount, --output-directory /modal-data/output, ASGI proxy
+  - /ComfyUI mount, --output-directory /modal-data/output
   - copy_dir_contents from Modal Volume to /ComfyUI/models/
-  - same 600s startup, 1800s timeout, 300s scaledown_window (R.117 5s, Task F 2026-09-16 → 120s, Task B 2026-09-17 → 300s, Task G 2026-09-17 → 60s + max_containers=1, Task H 2026-09-17 → 300s paired with Task C worker pre-warm)
+  - 600s startup, 1800s timeout, 300s scaledown_window
+  - @modal.concurrent(target_inputs=1, max_inputs=1) for serial GPU (BullMQ worker is
+    concurrency=1, so Modal-side 1-way concurrent matches)
+  - Rung 5 .spawn() + S3-only polling (same as H3)
 
-Differences from modal_comfyui.py:
-  - app name: comfyui-minimax-h3
-  - volume:   comfyui-minimax-h3-models (separate from comfyui-models)
-  - H3-specific custom nodes: ComfyUI-Easy-Use (for easy loadImageBase64 input)
-  - H3 models (~30 GB total): 22B UNet + Qwen3-VL CLIP + dual VAE (video + audio)
-    + turbo LoRA
+Styles shipped:
+  - wan22-face-portrait-nsfw  (Style A, ACTIVE 2026-09-26: Wan 2.1 + Phantom + NSFW, kijai stack)
+  - wan22-hearmeman-60fps     (Style B, ACTIVE 2026-09-27: Wan 2.2 SFW, comfy-core native
+                              WanImageToVideo + 2-pass KSamplerAdvanced + RIFE VFI 60 FPS,
+                              fp8_scaled diffusion + lightx2v/Wan2.2-Distill-Loras)
 
-URL: https://anton722451--comfyui-minimax-h3-serve.modal.run
-Env: MODAL_COMFYUI_BASE_URL_MINIMAX_H3 → above URL
+Style deferred (gated on Style B E2E result):
+  - wan22-hearmeman-60fps-nsfw (Style C, Wan 2.2 SFW + NSFW LoRA overlay)
 
 Deploy:
   cd /Volumes/SSDNSKIY/VSCODE/comfyui-first-video
-  modal deploy modal_comfyui_minimax_h3.py
-  modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx
+  modal deploy modal_comfyui_wan22.py
+  modal run modal_comfyui_wan22.py::setup_wan22_models --hf-token hf_xxx
 """
 
 import os
 import time
 import threading
 import logging
+
 import modal
-# FastAPI imports are deferred to method scope (Task #91) because modal
-# CLI introspects this file locally during `modal deploy`, where fastapi
-# may not be installed. The Modal container itself has fastapi via the
-# sombi base image.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("modal-comfyui-h3")
+log = logging.getLogger("modal-comfyui-wan22")
 
-app = modal.App("comfyui-minimax-h3")
-# SEPARATE volume — H3 (~30 GB) does NOT share with LTX-2's comfyui-models volume.
-# This keeps LTX-2 deployment unaffected even if H3 fills the volume.
-h3_models_volume = modal.Volume.from_name(
-    "comfyui-minimax-h3-models", create_if_missing=True
+app = modal.App("comfyui-wan22")
+# SEPARATE volume — Wan 14B + T5-XXL ~22 GB for Style A only.
+wan22_models_volume = modal.Volume.from_name(
+    "comfyui-wan22-models", create_if_missing=True
 )
 
+# Same Rung 5 S3 secret as H3 — reuse reelant-s3 Modal Secret for result PUT.
+_SECRETS = [modal.Secret.from_name("reelant-s3")]
+
+
 # =============================================================================
-# R.119 (2026-09-05): idempotency state for H3Generator.generate().
-# Atomic nonce-keyed claim — see handoff doc + memory card
-# r119-cold-start-idempotency-required-2026-09-05. Without this, cold-start
-# retries create duplicate GPU jobs because the Modal Web Function gateway
-# 307-redirects at 150s AFTER the function has already entered on the GPU
-# container (verified empirically 2026-09-05).
+# Image build — sombi base + ComfyUI v0.3.46 + custom nodes for Wan
 # =============================================================================
-# Task #218 (2026-09-13): DROP modal.Dict "jobs" — replaced by Modal-native
-# FunctionCall.from_id(call_id).get(timeout=0) for async result retrieval.
-# Why switch away from Dict (full RCA: research-modal-webhook-api-2026-09-13.md
-# + proposal-fix-modal-303-cold-start-2026-09-13.md):
-#   1. Dict eventual-consistency on container scaledown causes poll-7
-#      "not_found" misclassification (4 incidents: adb39bb8, e36f6c07,
-#      27d31af5, 24936235 — see task23 cluster).
-#   2. The 150s gateway 303 transport break CANNOT be patched at the Dict
-#      layer — only .spawn() (returns immediately, no blocking request thread)
-#      bypasses the cold-start window entirely.
-# FunctionCall is the community-blessed pattern per Modal docs:
-#   https://modal.com/docs/guide/webhook-timeouts (see .spawn() section)
-#   https://modal.com/docs/guide/trigger-deployed-functions (FunctionCall.from_id)
-# Idempotency: worker keeps `call_id` for the lifetime of the job. If a
-# worker retry happens, it re-polls the SAME call_id (not a new spawn), so
-# concurrent submits with the same nonce are the WORKER's responsibility, not
-# Modal's. Task #163 already added this dedup.
-# Rung 3 (2026-09-17): add `reelant-s3` Modal Secret (AWS creds + endpoint) so
-# api_run can PUT the result MP4 directly to Cr.Golden-Antelope S3. Worker
-# polls S3 by gen_id instead of polling Modal — eliminates the 303/Location
-# contract entirely. See memory [[modal-rung-3-s3-result-delivery-2026-09-17]].
-_R119_SECRETS = [modal.Secret.from_name("reelant-s3")]
+image = (
+    modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
+    .run_commands(
+        "apt-get update && apt-get install -y --no-install-recommends git wget ca-certificates python3 python3-venv python3-pip && rm -rf /var/lib/apt/lists/*",
+        "python3 -m pip install --no-cache-dir --break-system-packages pip setuptools wheel || true",
+    )
+    .run_commands(
+        "rm -rf /ComfyUI",
+        "git clone --depth=1 --branch v0.33.2 https://github.com/comfyanonymous/ComfyUI /ComfyUI",
+    )
+    .run_commands(
+        "pip install --no-cache-dir -r /ComfyUI/requirements.txt",
+    )
+    .run_commands(
+        "git clone --depth=1 https://github.com/kijai/ComfyUI-WanVideoWrapper /ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper",
+        "git clone --depth=1 https://github.com/kijai/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-KJNodes",
+        "git clone --depth=1 https://github.com/rgthree/rgthree-comfy /ComfyUI/custom_nodes/rgthree-comfy",
+        "git clone --depth=1 https://github.com/Fannovel16/ComfyUI-Frame-Interpolation /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation",
+        "git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite /ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
+        "git clone --depth=1 https://github.com/yolain/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-Easy-Use",
+        # Task #65 (2026-09-29): TeaCache — block-output caching, different mechanism
+        # from SageAttention (no SDPA kernel swap, so no warm-container CUDA state
+        # corruption). Expected 1.6-1.9x speedup vs fp8 baseline (131.7s → ~70-85s).
+        #
+        # Why welltop-cn instead of kijai WanVideoEasyCache: Style B workflow uses
+        # comfy-core native WanImageToVideo + KSamplerAdvanced, NOT kijai WanVideoSampler.
+        # kijai's WanVideoTeaCache/WanVideoEasyCache hook via cache_args into
+        # WanVideoSampler only — they don't apply here.
+        #
+        # Known risks for this path:
+        #   1. welltop-cn last commit 2025-07-12 (stale, but functional)
+        #   2. Wan 2.2 tuning absent (Wan 2.1 coefficients only). Threshold scale
+        #      is 10x different in published table — start at rel_l1_thresh=0.20
+        #      for Wan 2.2 (conservative, identity first).
+        #   3. Warm-container state may not reset between gens (similar to kijai
+        #      Issue #371) — 3-trial E2E (1 cold + 2 warm) MUST verify quality.
+        "git clone --depth=1 https://github.com/welltop-cn/ComfyUI-TeaCache /ComfyUI/custom_nodes/ComfyUI-TeaCache",
+    )
+    .run_commands(
+        "for r in /ComfyUI/custom_nodes/*/requirements.txt; do "
+        "[ -f \"$r\" ] && pip install --no-cache-dir -r \"$r\" || true; "
+        "done",
+        "pip install --no-cache-dir opencv-python imageio_ffmpeg",
+        "pip install --no-cache-dir fastapi httpx 'starlette>=0.36' boto3",
+        # Task #91 (2026-09-29): switch SageAttention from thu-ml main (2.2.0+) to
+        # pip-released 1.0.6. Same kernel family, but prebuilt wheel (no JIT), no
+        # build isolation, no TORCH_CUDA_ARCH_LIST. Same launch flag works
+        # (--use-sage-attention). Pattern from customWF2026/modal_comfydeploy.
+        # NOTE: SageAttention flag is currently DISABLED in launch (Task #85) due
+        # to warm-container CUDA state corruption; kernel is installed for future
+        # re-enable (single flag flip). Task #85b re-enable attempt FAILED at 3rd
+        # warm gen (KSamplerAdvanced node 311).
+        "pip install --no-cache-dir --break-system-packages sageattention==1.0.6",
+        "pip install --no-cache-dir --break-system-packages transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
+    )
+    .entrypoint([])
+)
+
+
+# =============================================================================
+# Setup job: download Wan 2.1 + Phantom + NSFW models to Modal Volume
+# =============================================================================
+WAN22_FILES = [
+    # ─── Style A: Wan 2.1 + Phantom + NSFW (kijai stack) — shipped 2026-09-26 ───
+    (
+        "diffusion_models/Wan2_1-T2V-14B-Phantom_fp8_e4m3fn_scaled_KJ.safetensors",
+        "https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/T2V/Wan2_1-T2V-14B-Phantom_fp8_e4m3fn_scaled_KJ.safetensors",
+        14_000_000_000,
+    ),
+    (
+        "vae/wan_2.1_vae.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
+        200_000_000,
+    ),
+    (
+        "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        4_500_000_000,
+    ),
+    (
+        "clip_vision/clip_vision_h.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors",
+        1_000_000_000,
+    ),
+    (
+        "loras/wan2.1_t2v_14b_lora_rank64_lightx2v_4step.safetensors",
+        "https://huggingface.co/lightx2v/Wan2.1-Distill-Loras/resolve/main/wan2.1_t2v_14b_lora_rank64_lightx2v_4step.safetensors",
+        500_000_000,
+    ),
+    (
+        "loras/wan_cowgirl_v1.2.safetensors",
+        "https://huggingface.co/mama2121/wan2.1lora/resolve/main/wan_cowgirl_v1.2.safetensors",
+        250_000_000,
+    ),
+    # ─── Style B: Wan 2.2 I2V SFW (comfy-core native + RIFE 60 FPS) — 2026-09-27 ───
+    # fp8_scaled (NOT _e4m3fn — _e4m3fn variant doesn't exist on HF for Wan 2.2 I2V).
+    # Saves ~28 GB total vs fp16 (~29 GB → ~14 GB per file).
+    (
+        "diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+        14_000_000_000,
+    ),
+    (
+        "diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+        14_000_000_000,
+    ),
+    # ─── Reference-clone A/B test (Task #60, 2026-09-28) ─────────────
+    # fp16 variants of Wan 2.2 I2V diffusion models (same Wan 2.2 weights,
+    # uncompressed). User's reference workflow (handover/reelant/2026-09-26_wan22_split/wan22-hearmeman-60fps.workflow.json,
+    # 35 nodes) uses fp16; our current Style B uses fp8_scaled (smaller,
+    # slightly lossy). New style 'wan22-hearmeman-60fps-ref' will switch
+    # UNETLoader to these fp16 files via the workflow JSON. The copy loop
+    # already picks up everything under /modal-data/models/diffusion_models/.
+    (
+        "diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors",
+        28_000_000_000,
+    ),
+    (
+        "diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors",
+        28_000_000_000,
+    ),
+    # lightx2v 4-step distill LoRAs for Wan 2.2 I2V (high + low noise).
+    # Repo: lightx2v/Wan2.2-Distill-Loras (NOT Wan2.2-I2V-A14B-Diffusers-distill-LoRA — 404).
+    (
+        "loras/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+        "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+        635_000_000,
+    ),
+    (
+        "loras/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+        "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+        635_000_000,
+    ),
+    # ─── Style B (RIFE 60 FPS): RIFE VFI model, Task #15 (2026-09-27) + Task #268 ───
+    # Fannovel16/ComfyUI-Frame-Interpolation vfi_utils.get_ckpt_container_path
+    # returns `<custom_node>/ckpts/rife/` (NOT /ComfyUI/models/<sub>/). The
+    # setup_wan22_models worker + the @modal.enter()'s copy loop stages the file
+    # there explicitly below.
+    # Task #268 (2026-09-30): GitHub Releases egress is unreliable from Modal
+    # containers — Fannovel16's auto-download silently fails and the executor
+    # bypasses RIFE (Task #173 fail-soft). Swap to HF mirror (proven reachable
+    # for Wan 2.2/Phantom/lightx2v in this same Modal image). SHA-256 verified
+    # in @modal.enter() copy block below — catches silent-truncated-download
+    # failure mode that expected_min gate misses.
+    (
+        "rife/rife49.pth",
+        "https://huggingface.co/marduk191/rife/resolve/main/rife49.pth",
+        21_300_000,
+    ),
+]
+
+
+@app.function(
+    image=image,
+    volumes={"/modal-data": wan22_models_volume},
+    cpu=4,
+    memory=8192,
+    timeout=7200,
+    startup_timeout=600,
+)
+def setup_wan22_models(hf_token: str = "") -> dict:
+    """Download Wan 2.1 + Phantom model set to Modal Volume. Idempotent. Total ~22 GB for Style A."""
+    os.environ["HF_TOKEN"] = hf_token
+    import urllib.request
+    hdr = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+
+    if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
+        os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
+
+    log.info("=== Downloading Wan 2.1 + Phantom model set — Style A (~22 GB) ===")
+    for rel_path, url, expected_min in WAN22_FILES:
+        dst = f"/modal-data/models/{rel_path}"
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst) and os.path.getsize(dst) > expected_min * 0.95:
+            log.info(f"{rel_path}: already present ({os.path.getsize(dst)/1e9:.2f} GB)")
+            continue
+        log.info(f"Downloading {rel_path} from {url}")
+        req = urllib.request.Request(url, headers=hdr)
+        try:
+            with urllib.request.urlopen(req, timeout=7200) as r, open(dst, "wb") as f:
+                while True:
+                    chunk = r.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            log.info(f"{rel_path}: done ({os.path.getsize(dst)/1e9:.2f} GB)")
+        except Exception as e:
+            log.error(f"Failed to download {rel_path}: {e}")
+            raise
+
+    wan22_models_volume.commit()
+    return {"status": "ok", "files": len(WAN22_FILES)}
 
 
 # =============================================================================
 # Task #176 (2026-09-18): Manual SigV4 PUT — bypass boto3 entirely.
-#
-# Background: Modal's boto3 put_object to s3-api.cr.golden-antelope.ru fails
-# with XAmzContentSHA256Mismatch (v65-v67) or SignatureDoesNotMatch (v68-v70)
-# — deterministic, only from Modal's egress. The same endpoint works from
-# worker's AWS SDK v3 (Node.js) on the same CapRover VPS. Manual local
-# boto3 PUT also works. The failure is specific to Modal-boto3.
-#
-# UNSIGNED-PAYLOAD attempt (v68-v70) doesn't help — this MinIO rejects it
-# with SignatureDoesNotMatch. We don't know yet whether the issue is
-# boto3-specific body framing, Content-Length handling, or some Modal egress
-# proxy modification. The cleanest debug is to bypass boto3 entirely and
-# control the exact bytes on the wire via stdlib urllib.
-#
-# 40-line manual SigV4 PUT (this block). If it works → boto3-specific
-# framing issue (could be addressed later, or stay with this manual impl).
-# If it ALSO fails with SHA mismatch → root cause is in-transit body
-# modification (VPS-level nginx config fix needed, not client-side).
+# (Ported from H3 generator — same S3 endpoint, same SHA mismatch issue.)
 # =============================================================================
 import hashlib as _hashlib
 import hmac as _hmac
@@ -187,16 +343,11 @@ def _sigv4_put(url, body, *, access_key, secret_key, region, bucket, key,
 def _write_failure_marker(nonce: str, *, error: str) -> None:
     """Task #178 (2026-09-18): fail-fast signal for Rung 5 .spawn() workers.
 
-    Modal `.spawn()` is fire-and-forget — RuntimeError inside `generate()` does
-    not propagate to the HTTP caller (worker's submitRemoteJob). Without this
-    marker, worker polls S3 for the MP4 up to 25 min until sweeper force-fails.
-
     Writes a small JSON sidecar at `generations/{nonce}.failed.json` so worker's
     pollS3ByGenId can HEAD it BEFORE polling `.mp4` and throw RemoteFailedError
     immediately (Layer B in Task #178).
 
-    Reuses `_sigv4_put()` from Task #176 (manual SigV4 PUT bypasses boto3
-    SHA/Sig mismatch against s3-api.cr.golden-antelope.ru).
+    Reuses `_sigv4_put()` from Task #176.
     """
     import json as _json
     import time as _time
@@ -207,11 +358,6 @@ def _write_failure_marker(nonce: str, *, error: str) -> None:
         "failed_at": _time.time(),
     }).encode("utf-8")
     try:
-        # Task #178 follow-up (2026-09-20): use AWS_ENDPOINT_URL (matches
-        # `reelant-s3` Modal Secret keys + the success path's _sigv4_put at
-        # line ~932). Previous S3_ENDPOINT_URL raised KeyError because that
-        # key was never set in the secret — workers polling S3 saw neither
-        # .mp4 nor .failed.json, kept polling up to sweeper timeout.
         status, _resp = _sigv4_put(
             url=os.environ["AWS_ENDPOINT_URL"],
             body=body,
@@ -230,14 +376,7 @@ def _write_failure_marker(nonce: str, *, error: str) -> None:
 
 def _with_failure_marker(method):
     """Task #178: decorator that wraps `_run_workflow` (and similar) so any
-    RuntimeError raised inside (e.g. OOM at node 151 SamplerCustomAdvanced —
-    comfy_kitchen.int8_linear workspace exceeds H100 80GB VRAM for params
-    width=1344 height=768 length=90 on minimax-h3-i2v) writes a fail-fast
-    marker to S3 BEFORE re-raising.
-
-    Other exceptions (httpx.HTTPError, etc.) propagate unchanged — only
-    workflow-level RuntimeErrors trigger the marker (these are the cases
-    where worker has no other signal that the job is dead).
+    RuntimeError raised inside writes a fail-fast marker to S3 BEFORE re-raising.
     """
     import functools as _ft
     @_ft.wraps(method)
@@ -252,257 +391,18 @@ def _with_failure_marker(method):
     return wrapper
 
 
-image = (
-    modal.Image.from_registry("sombi/comfyui:base-torch2.8.0-cu124")
-    .run_commands(
-        # Install git + python3 (sombi base uses uv-managed Python, not /usr/bin/python3)
-        "apt-get update && apt-get install -y --no-install-recommends git wget ca-certificates python3 python3-venv python3-pip && rm -rf /var/lib/apt/lists/*",
-        "python3 -m pip install --no-cache-dir --break-system-packages pip setuptools wheel || true",
-    )
-    .run_commands(
-        # REPLACE sombi's frozen ComfyUI v0.18.1 with a fresh clone of v0.33.2.
-        # Why: v0.18.1 lacks the comfy.ldm.minimax module that provides the local
-        # MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo nodes. We need v0.30+
-        # (we pin v0.33.2 = latest stable as of 2026-08-20) for native H3 support.
-        "rm -rf /ComfyUI",
-        "git clone --depth=1 --branch v0.33.2 https://github.com/comfyanonymous/ComfyUI /ComfyUI",
-    )
-    .run_commands(
-        # Install fresh ComfyUI's base requirements (replaces sombi's frozen /venv pkgs
-        # with whatever v0.33.2 needs).
-        "pip install --no-cache-dir -r /ComfyUI/requirements.txt",
-    )
-    .run_commands(
-        # Custom nodes for H3:
-        # - ComfyUI-Easy-Use: provides easy loadImageBase64 (node 220 in our workflow)
-        # - ComfyUI-KJNodes: PatchSageAttentionKJ (recommended for H3 speedup, per
-        #   https://docs.comfy.org/tutorials/video/minimax/minimax-h3) + ImageResizeKJv2
-        # - ComfyUI-LTXVideo: MiniMaxH3SigmaShift (H3 sigma-shift helper node)
-        # - Comfyui_Minimax_h3_latent_Upscaler (LBH-123-AI): MinimaxH3LatentUpscaler3D
-        #   class for 24-channel H3 latent 3D upscaling. Used by
-        #   minimax-h3-preview-upscaled style — first-pass 448x768 then 2x upscale
-        #   to 896x1536 (~50-60% baseline cost, visually competitive). Weights are
-        #   downloaded separately by setup_minimax_h3_models() into
-        #   /ComfyUI/models/latent_upscale_models/. See MEMORY [[modal-h3-upscaler-2026-09-01]].
-        "rm -rf /ComfyUI/custom_nodes/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
-        "git clone --depth=1 https://github.com/yolain/ComfyUI-Easy-Use /ComfyUI/custom_nodes/ComfyUI-Easy-Use",
-        "git clone --depth=1 https://github.com/kijai/ComfyUI-KJNodes /ComfyUI/custom_nodes/ComfyUI-KJNodes",
-        "git clone --depth=1 https://github.com/Lightricks/ComfyUI-LTXVideo /ComfyUI/custom_nodes/ComfyUI-LTXVideo",
-        "git clone --depth=1 https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler /ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler",
-    )
-    .run_commands(
-        # Install custom node deps
-        "for r in /ComfyUI/custom_nodes/*/requirements.txt; do "
-        "[ -f \"$r\" ] && pip install --no-cache-dir -r \"$r\" || true; "
-        "done",
-        "pip install --no-cache-dir opencv-python imageio_ffmpeg",
-        # ASGI proxy deps (serve() uses FastAPI + httpx)
-        "pip install --no-cache-dir fastapi httpx 'starlette>=0.36' boto3",
-        # Sage attention — soft requirement for MiniMax H3 (recommended in docs.comfy.org).
-        # MUST install from git — SageAttention 2.2.0 is NOT on PyPI (latest = 1.0.6, Nov 2024).
-        # PyPI install of "sageattention==2.2.0" silently fails with "No matching distribution",
-        # which previously got masked by `|| true` and a Modal layer cache hit → deploy
-        # "succeeded" but SA2 kernels never landed in the image. Now we install from git
-        # main branch (pinned to commit d1a57a5 = 2.2.0 with sm90 FP8 kernels).
-        #
-        # CRITICAL: TORCH_CUDA_ARCH_LIST must be set BEFORE pip install. Modal build
-        # workers have NO GPU → torch.utils.cpp_extension can't auto-detect compute
-        # capability → build dies with "No target compute capabilities". H100 = Hopper
-        # = sm_90; we add "9.0+PTX" for forward-compat.
-        #
-        # --no-build-isolation makes pip use the image's already-installed torch 2.8.0 /
-        # triton 3.0+ / CUDA 12.4 (so the compiled kernels bind to ABI-compatible torch).
-        # Without --no-build-isolation pip builds in an isolated env with OLD torch →
-        # missing _qattn_sm90 / _qattn_sm120 kernels → "sageattention is not new enough"
-        # or "could not determine CUDA architecture" errors at runtime.
-        #
-        # We keep fallback (warn-only) because SA2 is an optimization, not a hard
-        # requirement — but we now log install output instead of `|| true`-silencing it.
-        "TORCH_CUDA_ARCH_LIST='9.0+PTX' pip install --no-cache-dir --break-system-packages "
-        "--no-build-isolation "
-        "git+https://github.com/thu-ml/SageAttention.git 2>&1 | tail -10 "
-        "|| echo 'WARN: sageattention install failed — falling back to comfy kitchen attention'",
-        # Pin transformers/torchaudio/huggingface_hub to CUDA 12-compatible versions
-        # (sombi base ships v5.x which conflicts with comfy.ldm.minimax imports).
-        "pip install --no-cache-dir --break-system-packages transformers==4.56.0 huggingface_hub==0.36.2 torchaudio==2.8.0",
-        # R.109 reverted 2026-09-18 (Plan #40). H3 sampler emits NestedTensor bundling
-        # 24-ch video + 32-ch audio; upscaler.forward() expects 5D only. Inline patch
-        # (R.109..R.109h) failed because the 5D constraint blocks NT conversion.
-        # Real fix lives in the workflow JSON: LTXVSeparateAVLatent before node 500,
-        # LTXVConcatAVLatent after. See Plan #40 + retrospectives.
-    )
-    .entrypoint([])  # disable base image entrypoint; we start ComfyUI ourselves
-)
-
-
 # =============================================================================
-# Setup job: download H3 models to Modal Volume
-# =============================================================================
-@app.function(
-    image=image,
-    volumes={"/modal-data": h3_models_volume},
-    cpu=4,
-    memory=8192,
-    timeout=7200,
-    startup_timeout=600,
-)
-def setup_minimax_h3_models(hf_token: str = "") -> dict:
-    """Download MiniMax-H3 models to Modal Volume. Idempotent.
-
-    Total ~30 GB. Files confirmed against https://huggingface.co/Comfy-Org/MiniMax-H3:
-      - diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors (~14 GB)
-        (fl2va = first-last-frame-to-video. Pair with the 8-step turbo LoRA below.)
-      - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors (~15 GB)
-      - vae/minimax_h3_video_vae_fp16.safetensors  (NOT fp8 — fp8 doesn't exist)
-      - vae/minimax_h3_audio_vae_fp32.safetensors  (NOT fp8 — fp8 doesn't exist)
-      - loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
-        (8-step is more flexible than 4-step; supports both 5s and 10s outputs.)
-    """
-    os.environ["HF_TOKEN"] = hf_token
-    import urllib.request
-    hdr = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
-
-    # Symlink /runpod-volume → /modal-data so any custom-node code that uses
-    # /runpod-volume paths works.
-    if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
-        os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
-
-    # ---- H3 model registry — VERIFIED against Comfy-Org/MiniMax-H3 2026-08-20 ----
-    # R.185 (2026-09-22): fl2va → ref2va swap for persistent face/identity preservation.
-    # ref2va is the matching checkpoint for MiniMaxH3ReferenceToVideo (vs fl2va for
-    # MiniMaxH3ImageToVideo). ref2va keeps identity stable across frames via multi-image
-    # packing; fl2va only sees first+last frames and forgets identity in between.
-    # Acc-8Step LoRA for ref2va from Kijai replaces the fl2v-turbo LoRA (not compatible).
-    H3_FILES = [
-        # (relative_path_under_models/, source_url, expected_min_bytes)
-        (
-            "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-            20_000_000_000,
-        ),
-        (
-            "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-            15_000_000_000,
-        ),
-        (
-            "vae/minimax_h3_video_vae_fp16.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors",
-            500_000_000,
-        ),
-        (
-            "vae/minimax_h3_audio_vae_fp32.safetensors",
-            "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
-            200_000_000,
-        ),
-        (
-            "loras/MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors",
-            "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors",
-            1_700_000_000,
-        ),
-        # Mystic XXX — community style LoRA for H3 (lynaNSFW/mysticxxx_MM_H3, V4 pruned)
-        # strength_model 0.5-0.9; stacks after Turbo. See lynaNSFW HF repo for trigger guidance.
-        (
-            "loras/MysticXXX_MMH3-V4.safetensors",
-            "https://huggingface.co/lynaNSFW/mysticxxx_MM_H3/resolve/main/MysticXXX_MMH3-V4.safetensors",
-            100_000_000,
-        ),
-        # H3 3D latent upscaler (bf16) — required by minimax-h3-preview-upscaled style.
-        # BCTHW-aware: handles H3's 24-channel latent including temporal dim. Default
-        # 2x scale (40% of training data). Disk: ~691 MB.
-        # Placed in ComfyUI/models/latent_upscale_models/ where the LBH custom node's
-        # COMBO model_name field auto-discovers. See workflow node 500 in
-        # minimax-h3-preview-upscaled.cleaned.json + MEMORY [[modal-h3-upscaler-2026-09-01]].
-        (
-            "latent_upscale_models/minimax_h3_latent_upscaler_3d_bf16.safetensors",
-            "https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_bf16.safetensors",
-            600_000_000,  # 691 MB - 10% tolerance
-        ),
-    ]
-
-    log.info("=== Downloading MiniMax-H3 model set (~30 GB) ===")
-    for rel_path, url, expected_min in H3_FILES:
-        dst = f"/modal-data/models/{rel_path}"
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if os.path.exists(dst) and os.path.getsize(dst) > expected_min * 0.95:
-            log.info(f"{rel_path}: already present ({os.path.getsize(dst)/1e9:.2f} GB)")
-            continue
-        log.info(f"Downloading {rel_path} from {url}")
-        req = urllib.request.Request(url, headers=hdr)
-        try:
-            with urllib.request.urlopen(req, timeout=7200) as r, open(dst, "wb") as f:
-                while True:
-                    chunk = r.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            log.info(f"{rel_path}: done ({os.path.getsize(dst)/1e9:.2f} GB)")
-        except Exception as e:
-            log.error(f"Failed to download {rel_path}: {e}")
-            raise
-
-    h3_models_volume.commit()
-    return {"status": "ok", "files": len(H3_FILES)}
-
-
-# =============================================================================
-# Task #218 (2026-09-13): serve() /api/status endpoint DELETED — replaced by
-# Modal-native FunctionCall.from_id(call_id).get(timeout=0) pattern (Option A
-# per Modal docs). The serve() function existed to host a Dict-based status
-# poll endpoint for worker polling, but that architecture had two failure modes:
-#   1. Cold-start 303 transport break (150s gateway limit)
-#   2. Dict eventual-consistency on container scaledown
-# Both are eliminated by switching api_run to .spawn() and adding api_result
-# below (H3Generator class method).
-# Worker's MODAL_STATUS_URL env var now points to H3Generator's api_result URL
-# (auto-named by Modal as `<app>-<class>-<method>.modal.run`). Same env var
-# name retained for back-compat; URL pattern changes from `/?nonce=` to
-# `/?call_id=` (query-param style because @modal.fastapi_endpoint does NOT
-# support path args — see [[modal-fastapi-endpoint-no-path-arg-2026-09-10]]).
-# =============================================================================
-
-
-# =============================================================================
-# R.119 (2026-09-05) + Task #218 (2026-09-13): H3Generator — direct method-based
-# invocation, no HTTP roundtrip. Returns video bytes directly so worker never
-# touches /api/view (which serves from ComfyUI's in-memory OUTPUTS_MAP and
-# 404s after scaledown).
-#
-# Idempotency model (v4 — Task #218 / Option A):
-#   R.119 v1-v3 used modal.Dict("jobs") for nonce-keyed atomic claim +
-#   result caching. REPLACED by Modal-native FunctionCall.from_id pattern.
-#   Worker keeps `call_id` from spawn response; retries by re-polling
-#   same call_id (not re-spawning). Concurrent submits with same nonce are
-#   the WORKER's responsibility, not Modal's (Task #163 already added this).
-#   See [[modal-fastapi-endpoint-no-path-arg-2026-09-10]] for URL pattern.
-# Flow:
-#   1. Run workflow via local ComfyUI on :8188 (same container, no HTTP proxy).
-#   2. Explicit volume.commit() before returning bytes — replaces R.137 watcher.
-# =============================================================================
-# Task A (2026-09-16): @modal.concurrent(target_inputs=4, max_inputs=4) lets
-# /api/result (sync FastAPI) serve polls while /api/run is mid-GPU-work on
-# the same H100 container. Without this, sync HTTP requests queue on the
-# container's threadpool until the GPU method returns (~minutes for a real
-# generation) — worker stalls on /api/result polling.
-# Modal Labs production-tested this combo on @modal.cls(enable_memory_snapshot=True)
-# + @modal.enter() — see sglang_snapshot.py / ministral3_inference.py.
-# NOTE: decorator order matters — @app.cls OUTSIDE, @modal.concurrent INSIDE
-# (opposite of standard "wrap outside" intuition). Modal SDK raises
-# InvalidError("Cannot stack @modal.concurrent on top of @app.cls()") if
-# reversed. sglang_snapshot.py and ministral3_inference.py both confirm
-# this order.
-# MEMORY [[modal-container-concurrency-hang-2026-09-16]].
 @app.cls(
     image=image,
-    volumes={"/modal-data": h3_models_volume},
-    secrets=_R119_SECRETS,
+    volumes={"/modal-data": wan22_models_volume},
+    secrets=_SECRETS,
     cpu=4,
     memory=16384,
     timeout=1800,                  # class-level container lifetime cap
-    enable_memory_snapshot=False,  # Task #176 (2026-09-18): snap=True caused snap-restore race that broke ComfyUI startup via _FakeProps.name AttributeError (and prior KeyError on memory_stats). H3_TASK216 patches (a/b/c) remain as dead defense-in-depth. Cold-start ~22s→~44s, acceptable since min_containers=0 + scaledown_window=300 make cold-starts rare.
+    enable_memory_snapshot=False,  # Task #176 (2026-09-18): snap=True caused snap-restore race that broke ComfyUI startup via _FakeProps.name AttributeError (and prior KeyError on memory_stats). WAN_TASK216 patches (a/b/c) remain as dead defense-in-depth. Cold-start ~22s→~44s, acceptable since min_containers=0 + scaledown_window=300 make cold-starts rare.
     min_containers=0,
     scaledown_window=300,  # Task H (2026-09-17): 60→300 — Task C worker pre-warm on /api/run guarantees container alive at submit time, so 60s scaledown_window (Task G) was overkill. Bump back to 300s for safety margin: covers burst pattern (Gen 1 → 7+ min polling → Gen 2) where worker is busy on Gen 1 result fetch when Gen 2 pre-warm fires. With Task C + max_containers=1 + scaledown_window=300: container cold-starts ONCE per idle gap (≥300s = 5 min), then reused across burst.
-    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=1, max_inputs=1) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time. OOM follow-up (2026-09-20): 4→1 because worker is BullMQ-serial (concurrency:1), so Modal-side 4-way concurrent would have stacked overlapping H3 22B UNet activations and OOMed at node 151 sampler on 3rd consecutive gen.
+    max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=1, max_inputs=1) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time. OOM follow-up (2026-09-20): 4→1 because worker is BullMQ-serial (concurrency:1), so Modal-side 4-way concurrent would have stacked overlapping Wan 22B UNet activations and OOMed at node 151 sampler on 3rd consecutive gen.
     # 2026-09-09: buffer_containers REMOVED (was 1). Same rationale as serve().
     # MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
     buffer_containers=0,
@@ -514,7 +414,7 @@ def setup_minimax_h3_models(hf_token: str = "") -> dict:
     gpu="H100",
 )
 @modal.concurrent(target_inputs=1, max_inputs=1)  # OOM follow-up 2026-09-20: 4→1
-class H3Generator:
+class WanGenerator:
     @modal.enter(snap=False)  # Task #176: disable snap entirely — no snapshot, full cold-start every idle gap
     def setup(self):
         """Initialize GPU container once per cold start. Symlinks models,
@@ -524,7 +424,7 @@ class H3Generator:
         import pathlib
         import re
 
-        log.info("=== H3Generator.setup() — initializing GPU container ===")
+        log.info("=== WanGenerator.setup() — initializing GPU container ===")
 
         # Symlink so any internal /runpod-volume paths in custom nodes work
         if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
@@ -572,9 +472,15 @@ class H3Generator:
                 log.info(f"Copying {src} → {dst}")
                 shutil.copy2(src, dst)
 
+        # ponytail: Task #56 (2026-09-28) — clip_vision was missing from the
+        # copy loop, so comfy-core CLIPVisionLoader (#321) scanned an empty
+        # /ComfyUI/models/clip_vision/ dir and rejected the workflow with
+        # "clip_name: 'clip_vision_h.safetensors' not in []". File was already
+        # on the Modal volume (models/clip_vision/) — just needed the copy.
         all_subs = (
             "diffusion_models", "text_encoders", "vae",
             "loras", "latent_upscale_models", "checkpoints",
+            "clip_vision",
         )
         for sub in all_subs:
             os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
@@ -590,6 +496,134 @@ class H3Generator:
         log.info(f"[INSTR_COPY] model copy START wall={copy_start_wall:.3f} monotonic={copy_start_ts:.3f}")
         for sub in all_subs:
             copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+        # Task #15 (2026-09-27): Stage rife49.pth into ComfyUI-Frame-Interpolation
+        # custom_node's own ckpts/rife/ folder. The custom_node reads from
+        # `<custom_node>/ckpts/rife/rife49.pth` (Fannovel16/vfi_utils.py — relative
+        # path to vfi_utils.py). NOT /ComfyUI/models/other/. Pre-bundle keeps RIFE
+        # working at request-time without needing GitHub firewall egress.
+        rife_ckpt_src = "/modal-data/models/rife/rife49.pth"
+        rife_ckpt_dst_dir = "/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife"
+        os.makedirs(rife_ckpt_dst_dir, exist_ok=True)
+        rife_ckpt_dst = f"{rife_ckpt_dst_dir}/rife49.pth"
+        if os.path.exists(rife_ckpt_src):
+            if not os.path.exists(rife_ckpt_dst) or os.path.getsize(rife_ckpt_dst) != os.path.getsize(rife_ckpt_src):
+                shutil.copy2(rife_ckpt_src, rife_ckpt_dst)
+                log.info(f"[INSTR_RIFE] staged {rife_ckpt_src} -> {rife_ckpt_dst}")
+            else:
+                log.info(f"[INSTR_RIFE] already staged at {rife_ckpt_dst}")
+            # Task #268 (2026-09-30): SHA-256 verify catches silent-truncated-download
+            # failure mode (file exists + passes expected_min gate but content is garbage).
+            # Hardcoded SHA from Fannovel16 release — 21,345,274 bytes, verified by hand.
+            # Raises RuntimeError on mismatch → container fails to boot LOUDLY with a
+            # clear remediation hint, instead of silently serving 16 FPS videos.
+            import hashlib
+            _RIFE_SHA256 = "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533"
+            with open(rife_ckpt_dst, "rb") as _f:
+                _actual_sha = hashlib.sha256(_f.read()).hexdigest()
+            if _actual_sha != _RIFE_SHA256:
+                raise RuntimeError(
+                    f"rife49.pth SHA mismatch at {rife_ckpt_dst}: "
+                    f"got {_actual_sha}, expected {_RIFE_SHA256}. "
+                    f"Re-run `modal run modal_comfyui_wan22.py::setup_wan22_models "
+                    f"--hf-token hf_xxx` to re-bake from HF mirror."
+                )
+            log.info(f"[INSTR_RIFE] SHA verified {_actual_sha[:12]}...")
+        else:
+            log.warning(
+                f"[INSTR_RIFE] NOT FOUND: {rife_ckpt_src} — RIFE VFI may fall back "
+                f"to GitHub download at request-time. Task #268 frame-count assert "
+                f"in _run_workflow will surface silent-bypass as a hard error."
+            )
+
+        # Task #29 (2026-09-27): PATCH RIFE VFI custom_node line 238 — fix CPU/CUDA
+        # tensor mismatch in torch.cat(output_frames). Root cause: RIFE accumulates
+        # intermediate frames on CPU during inference (likely from clear_cache_after_n_frames
+        # sync flush). Final torch.cat then errors with "tensors is on cpu, different from
+        # other tensors on cuda:0". Fix: normalize device before cat. This is a 1-line
+        # patch on the custom_node file baked into the Modal image.
+        rife_init_py = "/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/vfi_models/rife/__init__.py"
+        if os.path.exists(rife_init_py):
+            with open(rife_init_py, "r") as _f:
+                _rife_src = _f.read()
+            _marker = "# RIFE_PATCH_2026_09_27 device-normalize before cat"
+            _dbg_marker = "# INSTR_RIFE_DEBUG: runtime probe"
+            _patched_any = False
+            if _marker not in _rife_src:
+                # Insert before the torch.cat call. The original line is:
+                #   out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)
+                _old = "out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)"
+                _new = (
+                    f"{_marker}\n"
+                    "        if len(output_frames) > 0:\n"
+                    "            _device = output_frames[0].device\n"
+                    "            output_frames = [f.to(_device) if f.device != _device else f for f in output_frames]\n"
+                    "        out_tensor = torch.cat(output_frames, dim=0).to(torch.float32)"
+                )
+                if _old in _rife_src:
+                    _rife_src = _rife_src.replace(_old, _new, 1)
+                    log.info(f"[INSTR_RIFE_PATCH] applied device-normalize patch to {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
+
+            if _dbg_marker not in _rife_src:
+                # Task #35 (2026-09-27): inject a [INSTR_RIFE_DEBUG] print()
+                # right after the first executable line inside vfi() so we can
+                # see in Modal logs exactly what multiplier + frames.shape
+                # reach RIFE at request time. Without this we cannot tell
+                # whether multiplier=4 from DB arrives intact or is silently
+                # coerced (e.g. coerced to int(1) by some upstream wrapper).
+                _dbg_old = "        from .rife_arch import IFNet"
+                _dbg_new = (
+                    "        from .rife_arch import IFNet\n"
+                    f"{_dbg_marker} — confirms multiplier reaches vfi() body.\n"
+                    "        import sys as _dbg_sys, torch as _dbg_torch\n"
+                    "        _dbg_sys.stdout.write(\n"
+                    "            f\"[INSTR_RIFE_DEBUG] multiplier={multiplier!r} \"\n"
+                    "            f\"type={type(multiplier).__name__} \"\n"
+                    "            f\"ckpt_name={ckpt_name!r} \"\n"
+                    "            f\"frames.shape={tuple(frames.shape) if hasattr(frames,'shape') else 'NA'} \"\n"
+                    "            f\"frames.device={getattr(frames,'device','NA')} \"\n"
+                    "            f\"dtype={dtype!r}\\n\"\n"
+                    "        )\n"
+                    "        _dbg_sys.stdout.flush()"
+                )
+                if _dbg_old in _rife_src:
+                    _rife_src = _rife_src.replace(_dbg_old, _dbg_new, 1)
+                    log.info(f"[INSTR_RIFE_DEBUG_PATCH] applied runtime-probe print to {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_DEBUG_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
+
+            # Persist whatever we patched to disk (idempotent — both markers above
+            # ensure re-runs are no-ops).
+            with open(rife_init_py, "w") as _f:
+                _f.write(_rife_src)
+            log.info(f"[INSTR_RIFE] patch phase complete for {rife_init_py}")
+
+            # Task #35 (2026-09-27): force module reload so ComfyUI sees the
+            # patched bytes. Root cause: if `_run_workflow` ran BEFORE this
+            # @enter() block completed (e.g. warm container reused), Python
+            # already imported vfi_models.rife and cached `_model_cache` +
+            # the `RIFE_VFI` class reference. Our file-on-disk patch is then
+            # dead code on the next generate() call. `importlib.reload()` +
+            # clearing the LRU cache invalidates the bound class. The 1-line
+            # `try/except` keeps the warm path cheap if the module isn't yet
+            # imported.
+            try:
+                import importlib
+                import sys as _sys
+                _sys.path.insert(0, "/ComfyUI/custom_nodes")
+                import vfi_models.rife as _rife_mod
+                importlib.reload(_rife_mod)
+                # Re-publish on the parent package registry so ComfyUI's
+                # NODE_CLASS_MAPPINGS lookup hits the freshly reloaded class.
+                import vfi_models as _vm
+                _vm.rife = _rife_mod
+                log.info(f"[INSTR_RIFE_RELOAD] forced module reload of {rife_init_py}")
+            except Exception as _reload_err:
+                log.warning(f"[INSTR_RIFE_RELOAD] skipped (module not yet importable): {_reload_err}")
+        else:
+            log.warning(f"[INSTR_RIFE_PATCH] custom_node not found at {rife_init_py} — RIFE may not be installed in this image")
+
         copy_duration = time.monotonic() - copy_start_ts
         log.info(f"[INSTR_COPY] model copy END wall={time.time():.3f} duration={copy_duration:.1f}s")
         log.info("Model copy complete")
@@ -628,7 +662,7 @@ class H3Generator:
         # INSIDE `get_total_memory` at line ~403 on
         # `stats['reserved_bytes.all.current']` when GPU telemetry dict is
         # missing fields during cold-start snap-restore (Modal app
-        # `comfyui-minimax-h3` crashlooping since v48 / 2026-09-13 10:24,
+        # `comfyui-wan22` crashlooping since v48 / 2026-09-13 10:24,
         # last known-good v47 = `4ef858e`). TypeError/AttributeError also
         # covered defensively for adjacent dict-access failures
         # (None stats, stale device handle, etc.).
@@ -639,11 +673,11 @@ class H3Generator:
         # are not required.
         # ------------------------------------------------------------------
         _mm_path = pathlib.Path("/ComfyUI/comfy/model_management.py")
-        _SENTINEL = "# H3_TASK216_PATCH: deferred_cuda_init"
+        _SENTINEL = "# WAN_TASK216_PATCH: deferred_cuda_init"
         try:
             _mm_src = _mm_path.read_text()
             if _SENTINEL in _mm_src:
-                log.info("model_management.py: H3_TASK216 patch already applied — skipping")
+                log.info("model_management.py: WAN_TASK216 patch already applied — skipping")
             else:
                 _pattern = re.compile(
                     r"^(\s*)total_vram\s*=\s*get_total_memory\(get_torch_device\(\)\)\s*/\s*\(1024\s*\*\s*1024\)\s*$",
@@ -653,7 +687,7 @@ class H3Generator:
                 if _m:
                     _indent = _m.group(1)
                     _replacement = (
-                        f"{_indent}# H3_TASK216_PATCH: deferred_cuda_init\n"
+                        f"{_indent}# WAN_TASK216_PATCH: deferred_cuda_init\n"
                         f"{_indent}try:\n"
                         f"{_indent}    total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)\n"
                         f"{_indent}except (RuntimeError, KeyError) as _e3_init_err:\n"
@@ -671,20 +705,20 @@ class H3Generator:
                         f"{_indent}    # failures (None stats, stale device handle, etc.).\n"
                         f"{_indent}    total_vram = 0\n"
                         f"{_indent}    logging.warning(\n"
-                        f"{_indent}        \"H3_TASK216d: deferred init in comfy.model_management caught %s: %s\",\n"
+                        f"{_indent}        \"WAN_TASK216d: deferred init in comfy.model_management caught %s: %s\",\n"
                         f"{_indent}        type(_e3_init_err).__name__, _e3_init_err,\n"
                         f"{_indent}    )"
                     )
                     _new_src = _mm_src[:_m.start()] + _replacement + _mm_src[_m.end():]
                     _mm_path.write_text(_new_src)
-                    log.info("model_management.py: applied H3_TASK216 deferred-CUDA-init patch")
+                    log.info("model_management.py: applied WAN_TASK216 deferred-CUDA-init patch")
                 else:
                     log.warning(
-                        "model_management.py: H3_TASK216 pattern not found — "
+                        "model_management.py: WAN_TASK216 pattern not found — "
                         "ComfyUI version may have changed; leaving file unchanged"
                     )
         except Exception as _patch_err:
-            log.warning(f"model_management.py: H3_TASK216 patcher failed: {_patch_err}")
+            log.warning(f"model_management.py: WAN_TASK216 patcher failed: {_patch_err}")
 
         # ------------------------------------------------------------------
         # Task #216b (2026-09-13): defer eager CUDA init in
@@ -705,11 +739,11 @@ class H3Generator:
         #
         # Idempotent: same sentinel-skipped re-run pattern as Task #216.
         # ------------------------------------------------------------------
-        _SENTINEL_2 = "# H3_TASK216_PATCH_GET_TORCH_DEVICE: deferred_cuda_init"
+        _SENTINEL_2 = "# WAN_TASK216_PATCH_GET_TORCH_DEVICE: deferred_cuda_init"
         try:
             _mm_src = _mm_path.read_text()
             if _SENTINEL_2 in _mm_src:
-                log.info("model_management.py: H3_TASK216b patch already applied — skipping")
+                log.info("model_management.py: WAN_TASK216b patch already applied — skipping")
             else:
                 # Match the bare CUDA branch in get_torch_device()'s else-fallback.
                 # Anchored on the leading 12-space indent (inside `else:` of the
@@ -723,7 +757,7 @@ class H3Generator:
                 if _m2:
                     _indent2 = _m2.group(1)
                     _replacement2 = (
-                        f"{_indent2}# H3_TASK216_PATCH_GET_TORCH_DEVICE: deferred_cuda_init\n"
+                        f"{_indent2}# WAN_TASK216_PATCH_GET_TORCH_DEVICE: deferred_cuda_init\n"
                         f"{_indent2}try:\n"
                         f"{_indent2}    return torch.device(torch.cuda.current_device())\n"
                         f"{_indent2}except RuntimeError as _e212_init_err:\n"
@@ -734,21 +768,21 @@ class H3Generator:
                         f"{_indent2}    # get_torch_device() call (after snap restore completes GPU bind) will\n"
                         f"{_indent2}    # return the real GPU device normally.\n"
                         f"{_indent2}    logging.warning(\n"
-                        f"{_indent2}        \"H3_TASK216b: deferred CUDA init in get_torch_device(): %s\",\n"
+                        f"{_indent2}        \"WAN_TASK216b: deferred CUDA init in get_torch_device(): %s\",\n"
                         f"{_indent2}        _e212_init_err,\n"
                         f"{_indent2}    )\n"
                         f"{_indent2}    return torch.device(\"cpu\")"
                     )
                     _new_src = _mm_src[:_m2.start()] + _replacement2 + _mm_src[_m2.end():]
                     _mm_path.write_text(_new_src)
-                    log.info("model_management.py: applied H3_TASK216b deferred-CUDA-init patch (get_torch_device line 212)")
+                    log.info("model_management.py: applied WAN_TASK216b deferred-CUDA-init patch (get_torch_device line 212)")
                 else:
                     log.warning(
-                        "model_management.py: H3_TASK216b pattern not found — "
+                        "model_management.py: WAN_TASK216b pattern not found — "
                         "ComfyUI version may have changed; leaving file unchanged"
                     )
         except Exception as _patch_err2:
-            log.warning(f"model_management.py: H3_TASK216b patcher failed: {_patch_err2}")
+            log.warning(f"model_management.py: WAN_TASK216b patcher failed: {_patch_err2}")
 
         # ------------------------------------------------------------------
         # Task #216c (2026-09-13): fundamental fix — monkey-patch torch.cuda
@@ -770,13 +804,13 @@ class H3Generator:
         # Namespacing: all injected names use _h3_* prefix to avoid collision
         # with any existing names in model_management.py.
         #
-        # Idempotent: sentinel H3_TASK216c_torch_cuda_tolerance.
+        # Idempotent: sentinel WAN_TASK216c_torch_cuda_tolerance.
         # ------------------------------------------------------------------
-        _SENTINEL_3 = "# H3_TASK216c_torch_cuda_tolerance"
+        _SENTINEL_3 = "# WAN_TASK216c_torch_cuda_tolerance"
         try:
             _mm_src = _mm_path.read_text()
             if _SENTINEL_3 in _mm_src:
-                log.info("model_management.py: H3_TASK216c patch already applied — skipping")
+                log.info("model_management.py: WAN_TASK216c patch already applied — skipping")
             else:
                 # Anchor: first `from __future__ import annotations` line.
                 # Falls back to first `import psutil` if upstream changes
@@ -794,7 +828,7 @@ class H3Generator:
                     _injection = (
                         "\n"
                         "\n"
-                        "# H3_TASK216c_torch_cuda_tolerance — DO NOT REMOVE\n"
+                        "# WAN_TASK216c_torch_cuda_tolerance — DO NOT REMOVE\n"
                         "# Modal @modal.enter() snapshots CPU+FS but NOT GPU state.\n"
                         "# After snap-restore, torch.cuda.* can raise RuntimeError(\"No CUDA GPUs ...\").\n"
                         "# Monkey-patch torch.cuda.get_device_properties and torch.cuda.current_device\n"
@@ -802,28 +836,28 @@ class H3Generator:
                         "# covers all current AND future call sites in model_management.py\n"
                         "# (Tasks #216d/#216e no longer needed).\n"
                         "try:\n"
-                        "    import torch as _h3_torch_216c\n"
-                        "    _h3_cuda_warned_216c = [False]\n"
-                        "    def _h3_cuda_log_216c():\n"
-                        "        if not _h3_cuda_warned_216c[0]:\n"
+                        "    import torch as _wan_torch_216c\n"
+                        "    _wan_cuda_warned_216c = [False]\n"
+                        "    def _wan_cuda_log_216c():\n"
+                        "        if not _wan_cuda_warned_216c[0]:\n"
                         "            import logging as _logging\n"
                         "            _logging.warning(\n"
-                        "                \"[H3_TASK216c] torch.cuda tolerance active \"\n"
+                        "                \"[WAN_TASK216c] torch.cuda tolerance active \"\n"
                         "                \"(snap-restore GPU race — safe defaults returned)\"\n"
                         "            )\n"
-                        "            _h3_cuda_warned_216c[0] = True\n"
-                        "    _h3_orig_get_dev_props_216c = _h3_torch_216c.cuda.get_device_properties\n"
-                        "    def _h3_safe_get_dev_props_216c(device):\n"
+                        "            _wan_cuda_warned_216c[0] = True\n"
+                        "    _wan_orig_get_dev_props_216c = _wan_torch_216c.cuda.get_device_properties\n"
+                        "    def _wan_safe_get_dev_props_216c(device):\n"
                         "        try:\n"
-                        "            return _h3_orig_get_dev_props_216c(device)\n"
+                        "            return _wan_orig_get_dev_props_216c(device)\n"
                         "        except RuntimeError:\n"
-                        "            _h3_cuda_log_216c()\n"
+                        "            _wan_cuda_log_216c()\n"
                         "            class _FakeProps:\n"
                         "                major = 9\n"
                         "                minor = 0\n"
                         "                multi_processor_count = 132\n"
                         "                total_memory = 80 * 1024 * 1024 * 1024\n"
-                        "                # H3_TASK216e — .name added so torch.cuda.get_device_name()\n"
+                        "                # WAN_TASK216e — .name added so torch.cuda.get_device_name()\n"
                         "                # (which calls get_device_properties(device).name) stops\n"
                         "                # crashing on snap-restore cold-start at\n"
                         "                # comfy/model_management.py:685 cuda_malloc_warning().\n"
@@ -833,35 +867,53 @@ class H3Generator:
                         "                is_multi_gpu_board = 0\n"
                         "                L2_cache_size = 50 * 1024 * 1024  # 50 MB\n"
                         "            return _FakeProps()\n"
-                        "    _h3_torch_216c.cuda.get_device_properties = _h3_safe_get_dev_props_216c\n"
-                        "    _h3_orig_cur_dev_216c = _h3_torch_216c.cuda.current_device\n"
-                        "    def _h3_safe_cur_dev_216c():\n"
+                        "    _wan_torch_216c.cuda.get_device_properties = _wan_safe_get_dev_props_216c\n"
+                        "    _wan_orig_cur_dev_216c = _wan_torch_216c.cuda.current_device\n"
+                        "    def _wan_safe_cur_dev_216c():\n"
                         "        try:\n"
-                        "            return _h3_orig_cur_dev_216c()\n"
+                        "            return _wan_orig_cur_dev_216c()\n"
                         "        except RuntimeError:\n"
-                        "            _h3_cuda_log_216c()\n"
+                        "            _wan_cuda_log_216c()\n"
                         "            return 0\n"
-                        "    _h3_torch_216c.cuda.current_device = _h3_safe_cur_dev_216c\n"
+                        "    _wan_torch_216c.cuda.current_device = _wan_safe_cur_dev_216c\n"
                         "except Exception:\n"
                         "    pass\n"
                     )
                     _new_src = _mm_src[:_inject_pos] + _injection + _mm_src[_inject_pos:]
                     _mm_path.write_text(_new_src)
-                    log.info("model_management.py: applied H3_TASK216c torch.cuda tolerance patch")
+                    log.info("model_management.py: applied WAN_TASK216c torch.cuda tolerance patch")
                 else:
                     log.warning(
-                        "model_management.py: H3_TASK216c anchor (from __future__ import annotations | "
+                        "model_management.py: WAN_TASK216c anchor (from __future__ import annotations | "
                         "import psutil) not found — ComfyUI version may have changed; leaving file unchanged"
                     )
         except Exception as _patch_err3:
-            log.warning(f"model_management.py: H3_TASK216c patcher failed: {_patch_err3}")
+            log.warning(f"model_management.py: WAN_TASK216c patcher failed: {_patch_err3}")
 
         # Launch ComfyUI on :8188 — same flags as prod serve() (R.128 baseline).
+        # Task #85: --use-sage-attention flag removed. Was enabled in Task #63 (commit
+        # 319393f) and verified on cold container (90.7s Modal internal, 1.45x speedup
+        # vs 131.7s baseline) — but Task #84 E2E found 33% failure rate on warm
+        # containers (KSamplerAdvanced node 311 failures, root-caused to Sage kernel
+        # CUDA state corruption). Upstream issues open: thu-ml/SageAttention #392
+        # (CUDA-graph replay) + ComfyUI #6125 (--use-sage-attention CUDA illegal
+        # memory access). Sage kernel remains installed at image-build (line 110);
+        # re-enabling is a one-line change once those close. Meanwhile we accept
+        # the ~131.7s baseline for reliability. Plan successor: Task #65 (TeaCache).
+        # Task #92 (2026-09-29): --cache-none added. Disables ComfyUI's node output
+        # caching (VAE decode, CLIP, LoraLoader, etc.). Fixes warm-container GPU
+        # OOM at KSamplerAdvanced node 311 (Task #91 trial 2 exposed it) — cached
+        # tensors from prior gen collided with new KSampler allocation (~28GB
+        # dual-UNet + cached nodes exceeded H100 80GB ceiling). Trade-off: gen 1
+        # is slower because VAE/CLIP re-encode every call (instead of cached). But
+        # the alternative is 33-100% warm-fail rate. Acceptable since most real
+        # traffic is cold-after-idle (Modal scales down containers after ~5min).
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
         self._proc = subprocess.Popen(
             [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
              "--port", "8188", "--disable-auto-launch", "--gpu-only",
+             "--cache-none",
              "--output-directory", "/modal-data/output"],
             stdout=log_file, stderr=subprocess.STDOUT,
         )
@@ -873,6 +925,45 @@ class H3Generator:
                 r = _httpx.get("http://localhost:8188/system_stats", timeout=2)
                 if r.status_code == 200:
                     log.info(f"ComfyUI ready after {i+1}s")
+                    # Diagnostic (Task #42): dump /object_info to verify KJNodes registered
+                    try:
+                        oi = _httpx.get("http://localhost:8188/object_info", timeout=10)
+                        if oi.status_code == 200:
+                            info = oi.json()
+                            names = sorted(info.keys())
+                            log.info(f"[diag] ComfyUI loaded {len(names)} node types")
+                            kj = [n for n in names if "ImageResizeKJv2" in n or "WanVideo" in n or "VHS" in n]
+                            log.info(f"[diag] KJ/Wan/VHS nodes: {kj}")
+                            has_iresizekjv2 = "ImageResizeKJv2" in names
+                            log.info(f"[diag] ImageResizeKJv2 registered: {has_iresizekjv2}")
+                            if not has_iresizekjv2:
+                                # Dump first 50 node names for debugging
+                                log.info(f"[diag] first 50 node names: {names[:50]}")
+                                # Show what's in custom_nodes
+                                try:
+                                    import os as _os
+                                    cn_path = "/ComfyUI/custom_nodes"
+                                    cn_dirs = _os.listdir(cn_path)
+                                    log.info(f"[diag] /ComfyUI/custom_nodes contents: {cn_dirs}")
+                                    for d in cn_dirs:
+                                        full = _os.path.join(cn_path, d)
+                                        if _os.path.isdir(full):
+                                            files = _os.listdir(full)[:5]
+                                            log.info(f"[diag] {d}/ first files: {files}")
+                                except Exception as _e1:
+                                    log.warning(f"[diag] custom_nodes ls failed: {_e1}")
+                                # Tail comfy.log for import errors
+                                try:
+                                    with open("/tmp/comfy.log") as f:
+                                        full = f.read()
+                                        log.info(f"[diag] comfy.log total size: {len(full)} chars")
+                                        # Show last 8000 chars — Traceback fully
+                                        tail = full[-8000:]
+                                        log.info(f"[diag] comfy.log tail (8000 chars):\n{tail}")
+                                except Exception as _e2:
+                                    log.warning(f"[diag] comfy.log tail failed: {_e2}")
+                    except Exception as _diag_err:
+                        log.warning(f"[diag] /object_info probe failed: {_diag_err}")
                     break
             except Exception:
                 pass
@@ -889,11 +980,11 @@ class H3Generator:
                     log.error(f.read())
             except Exception:
                 pass
-            raise RuntimeError("ComfyUI startup timeout (H3Generator)")
+            raise RuntimeError("ComfyUI startup timeout (WanGenerator)")
 
         # Track initial output files for diff-after-execution
         self._initial_outputs = set(os.listdir("/modal-data/output"))
-        log.info(f"H3Generator.setup() complete — initial_outputs={len(self._initial_outputs)}")
+        log.info(f"WanGenerator.setup() complete — initial_outputs={len(self._initial_outputs)}")
 
     @modal.method()
     def generate(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
@@ -906,7 +997,7 @@ class H3Generator:
 
         OOM follow-up (2026-09-20): torch.cuda.empty_cache() + gc.collect()
         at entry. Without this, consecutive requests on the same container
-        accumulate cached tensors — H3 22B UNet + HMNSFW/Turbo LoRA + audio
+        accumulate cached tensors — Wan 22B UNet + HMNSFW/Turbo LoRA + audio
         VAE ran OOM at node 151 SamplerCustomAdvanced for 3rd gen on the
         same container (800×800×90 after 2 prior gens). Modal doesn't
         auto-release between concurrent inputs.
@@ -921,7 +1012,7 @@ class H3Generator:
         """
         log.info(f"generate nonce={nonce}: starting (call_id-based)")
         # OOM follow-up (2026-09-20): release cached CUDA memory + GC before
-        # _run_workflow loads H3 22B UNet + LoRAs. Without this, 3rd consecutive
+        # _run_workflow loads Wan 22B UNet + LoRAs. Without this, 3rd consecutive
         # gen on the same container OOMed at node 151 sampler.
         try:
             import torch
@@ -985,7 +1076,7 @@ class H3Generator:
         # Modal container will be reused for the NEXT gen — and that next gen
         # gets a clean GPU instead of inheriting this gen's cached tensors.
         # Without this, 3rd consecutive gen on the same container OOMed at
-        # node 151 SamplerCustomAdvanced (H3 22B UNet activations).
+        # node 151 SamplerCustomAdvanced (Wan 22B UNet activations).
         try:
             import torch
             import gc as _gc_post
@@ -1023,7 +1114,7 @@ class H3Generator:
     def api_run(self, payload: dict) -> dict:
         """Rung 3 (2026-09-17): write MP4 to S3 + return status.
 
-        Calls H3Generator.generate() via .remote() (NOT .spawn()) — Modal
+        Calls WanGenerator.generate() via .remote() (NOT .spawn()) — Modal
         BLOCKS this request thread until generate() returns. Then PUTs the
         result to S3 at `generations/{nonce}.mp4`. Worker polls S3 by gen_id
         to know when result is ready.
@@ -1052,7 +1143,7 @@ class H3Generator:
             file either appears or doesn't).
 
         URL: Modal auto-names this as <app>-<class>-<method>.modal.run:
-            https://anton722451--comfyui-minimax-h3-h3generator-api-run.modal.run
+            https://anton722451--comfyui-wan22-h3generator-api-run.modal.run
         Worker calls this URL directly.
 
         Signature uses Modal's recommended pattern — `payload: dict` directly.
@@ -1163,6 +1254,85 @@ class H3Generator:
             except Exception as e:
                 log.warning(f"_run_workflow: image injection skipped — {e}")
 
+        # Task #42: decode data:image/...;base64,... OR raw base64 in LoadImage
+        # nodes to a temp file under /ComfyUI/input/, replace with filename.
+        # Required because v0.33.2 ComfyUI's LoadImage reads a filename from
+        # /ComfyUI/input/, NOT a data URI or raw base64. Worker merge() passes
+        # params.image (raw base64) directly into LoadImage's `image` field.
+        try:
+            import json as _json2
+            import base64 as _b64
+            import re as _re
+            import os as _os2
+            wj2 = workflow_json if isinstance(workflow_json, dict) else _json2.loads(workflow_json)
+            _os2.makedirs("/ComfyUI/input", exist_ok=True)
+            _img_idx = 0  # unique suffix per LoadImage in workflow
+            for _nid, _node in wj2.items():
+                if not (isinstance(_node, dict) and _node.get("class_type") == "LoadImage"):
+                    continue
+                _inp = _node.setdefault("inputs", {})
+                _img = _inp.get("image", "")
+                if not isinstance(_img, str) or not _img:
+                    continue
+                # Strip optional data URI prefix → raw base64
+                _b64str = _img
+                _m = _re.match(r"^data:image/(jpeg|jpg|png|webp);base64,(.+)$", _img, flags=_re.DOTALL)
+                if _m:
+                    _b64str = _m.group(2)
+                # Heuristic: if value has a real filename extension (.png/.jpg/etc)
+                # AND length is short enough to be a path, treat as filename.
+                # Otherwise try to decode as base64 (which can contain '/').
+                _looks_like_filename = bool(_re.match(r"^[\w./-]+\.(png|jpg|jpeg|webp)$", _b64str, flags=_re.IGNORECASE)) and "/" in _b64str.split("/")[0] is False and len(_b64str) < 256
+                if _looks_like_filename:
+                    log.info(f"_run_workflow: node {_nid} image looks like filename, leaving as-is: {_b64str[:60]}")
+                    continue
+                if len(_b64str) < 200:
+                    log.info(f"_run_workflow: node {_nid} image too short for base64 ({len(_b64str)}), leaving as-is: {_b64str[:60]}")
+                    continue
+                try:
+                    _raw = _b64.b64decode(_b64str, validate=True)
+                except Exception as _decode_err:
+                    log.warning(f"_run_workflow: node {_nid} image not valid base64 ({_decode_err}), leaving as-is")
+                    continue
+                _ext = "jpg"
+                # Sniff magic bytes for png/webp
+                if _raw[:8] == b"\x89PNG\r\n\x1a\n":
+                    _ext = "png"
+                elif _raw[:4] == b"RIFF" and _raw[8:12] == b"WEBP":
+                    _ext = "webp"
+                _img_idx += 1
+                _fname = f"wan22_{nonce}_{_img_idx}.{_ext}"
+                _fpath = f"/ComfyUI/input/{_fname}"
+                with open(_fpath, "wb") as _f:
+                    _f.write(_raw)
+                _inp["image"] = _fname
+                log.info(f"_run_workflow: node {_nid} decoded base64 → {_fpath} ({len(_raw)} bytes)")
+            workflow_json = wj2
+        except Exception as _loadimg_err:
+            log.warning(f"_run_workflow: LoadImage base64 decode skipped — {_loadimg_err}")
+
+        # Task #38 (2026-09-27): log the actual prompt body fields that reach
+        # ComfyUI for nodes 303 (RIFE VFI) + 94 (VHS_VideoCombine). After two
+        # generation cycles showing 81 frames at 16 FPS despite RIFE patched
+        # and DB correct, RIFE's vfi() body never executed (zero [INSTR_RIFE_DEBUG]
+        # logs in 88acf974 run). Need to confirm whether worker sends the
+        # expected multiplier=4 + frame_rate=60, or whether ComfyUI rewrites
+        # the body server-side. Single log line — no side-effects.
+        try:
+            _wf = workflow_json if isinstance(workflow_json, dict) else _json.loads(workflow_json)
+            _n303 = (_wf.get("303") or {}).get("inputs", {}) or {}
+            _n94 = (_wf.get("94") or {}).get("inputs", {}) or {}
+            log.info(
+                f"[INSTR_PROMPT_DEBUG] node303.multiplier={_n303.get('multiplier')!r} "
+                f"node303.frames={_n303.get('frames')!r} "
+                f"node303.dtype={_n303.get('dtype')!r} "
+                f"node94.images={_n94.get('images')!r} "
+                f"node94.frame_rate={_n94.get('frame_rate')!r} "
+                f"workflow_node_count={len(_wf)}"
+            )
+        except Exception as _prompt_dbg_err:
+            log.warning(f"[INSTR_PROMPT_DEBUG] failed: {_prompt_dbg_err}")
+
         body = {"prompt": workflow_json, "client_id": client_id}
         r = _httpx.post(
             "http://localhost:8188/api/prompt",
@@ -1203,20 +1373,86 @@ class H3Generator:
             raise RuntimeError(f"ComfyUI poll timeout for prompt_id={prompt_id}")
 
         # 3. Find output file. ComfyUI stores outputs in hist["outputs"][node_id]["videos"|"images"].
+        # Task #268 PR1.5 (2026-09-30): prefer outputs with non-empty subfolder.
+        # Mirrors the worker picker fix (apps/worker/src/providers/modal-comfyui.provider.ts:3424).
+        # RIFE-VFI post-process nodes write to subdirs like "Hunyuan/videos/30/"
+        # (final 60 FPS MP4), intermediate VideoCombine nodes (Wan 2.2 teacache)
+        # write to the root output dir with empty subfolder. Without this
+        # preference, _run_workflow would pick the teacache intermediate first
+        # (insertion order), upload 16 FPS bytes to S3, and the frame-count
+        # assertion below (which requires out_subfolder=="Hunyuan/videos/30")
+        # would never fire.
+        #
+        # Task #268 PR1.5b (2026-09-30): VHS_VideoCombine with a custom
+        # filename_prefix like "Hunyuan/videos/30/vid" BYPASSES ComfyUI history
+        # tracking entirely — the file is on disk but hist["outputs"] does NOT
+        # list it. In that case the history-based picker above can only see
+        # the intermediate (teacache) node. Override the empty-subfolder pick
+        # by scanning /modal-data/output/ recursively for a subfolder'd MP4.
+        # This is the filesystem equivalent of the worker picker preference.
         outputs = hist.get("outputs", {})
         out_filename = None
         out_subfolder = ""
         out_type = "output"
+        preferred = None  # (filename, subfolder, type) with non-empty subfolder
+        first_hit = None  # fallback for workflows without subfolder'd outputs
         for node_out in outputs.values():
             for kind in ("videos", "images", "gifs"):
-                if kind in node_out and node_out[kind]:
-                    first = node_out[kind][0]
-                    out_filename = first.get("filename")
-                    out_subfolder = first.get("subfolder", "")
-                    out_type = first.get("type", "output")
-                    break
-            if out_filename:
-                break
+                if not (kind in node_out and node_out[kind]):
+                    continue
+                for entry in node_out[kind]:
+                    _fn = entry.get("filename")
+                    if not _fn:
+                        continue
+                    _sub = entry.get("subfolder", "")
+                    _typ = entry.get("type", "output")
+                    _hit = (_fn, _sub, _typ)
+                    if _sub and preferred is None:
+                        preferred = _hit
+                    elif first_hit is None:
+                        first_hit = _hit
+        chosen = preferred or first_hit
+        if chosen:
+            out_filename, out_subfolder, out_type = chosen
+
+        # VHS_VideoCombine bypass: if history yielded an empty-subfolder file
+        # AND a subfolder'd MP4 exists on disk (e.g. from a VHS_VideoCombine
+        # node with filename_prefix="Hunyuan/videos/30/vid" that bypasses
+        # history tracking), prefer the subfolder'd file. Catches the case
+        # where the final-output VHS_VideoCombine isn't visible to the
+        # history-based picker at all. Newest mtime wins.
+        if not out_subfolder:
+            _override = None
+            _root = "/modal-data/output"
+            try:
+                for entry in os.scandir(_root):
+                    if not entry.is_dir():
+                        continue
+                    try:
+                        _cands = [
+                            f for f in os.listdir(entry.path)
+                            if f.endswith(".mp4") and os.path.isfile(os.path.join(entry.path, f))
+                        ]
+                    except OSError:
+                        continue
+                    for f in _cands:
+                        p = os.path.join(entry.path, f)
+                        try:
+                            m = os.path.getmtime(p)
+                        except OSError:
+                            continue
+                        if _override is None or m > _override[0]:
+                            _override = (m, entry.name, f)
+            except FileNotFoundError:
+                pass
+            if _override is not None:
+                _, _sub, _fn = _override
+                log.info(
+                    f"_run_workflow: VHS_VideoCombine bypass override "
+                    f"({out_filename!r} -> {_sub}/{_fn})"
+                )
+                out_filename = _fn
+                out_subfolder = _sub
 
         if not out_filename:
             raise RuntimeError(
@@ -1256,11 +1492,40 @@ class H3Generator:
             video_bytes = f.read()
         log.info(f"_run_workflow nonce={nonce} read {len(video_bytes)} bytes from {out_path}")
 
+        # Task #268 (2026-09-30): Frame-count assertion for HEARMEMAN RIFE workflows.
+        # HEARMEMAN workflow writes its RIFE-finalized output to subfolder
+        # "Hunyuan/videos/30" (per VHS_VideoCombine node 94 filename_prefix
+        # "Hunyuan/videos/30/vid"). At multiplier=4 over 81 input frames we
+        # expect ~321 output frames @ 60 FPS. The earlier in-graph RIFE VFI
+        # node (Task #173 fail-soft) silently bypassed on missing model and
+        # served 81-frame 16 FPS video under "60 FPS" metadata — this
+        # assertion surfaces that bug as a hard error instead.
+        # Cost: CAP_PROP_FRAME_COUNT is O(1) (reads mp4 header, no decode).
+        if out_subfolder == "Hunyuan/videos/30":
+            import cv2
+            _cap = cv2.VideoCapture(out_path)
+            _n_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            _cap.release()
+            # 280-360 covers actual HEARMEMAN output: 290 input × multiplier=4
+            # capped by VHS_VideoCombine to ~5s @ 60 FPS (~297 frames, observed
+            # 2026-09-30 PR1 verification). Narrower 300-340 window caused false
+            # positives on healthy generations.
+            if not (280 <= _n_frames <= 360):
+                raise RuntimeError(
+                    f"RIFE bypassed: HEARMEMAN output has {_n_frames} frames, "
+                    f"expected ~321 (300-340 window for multiplier=4 over ~80-85 input). "
+                    f"out_path={out_path}. Likely cause: rife49.pth missing from "
+                    f"/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/ "
+                    f"and GitHub auto-download failed (Task #173 fail-soft). "
+                    f"Check Modal app logs for `[INSTR_RIFE] NOT FOUND`."
+                )
+            log.info(f"[INSTR_RIFE] frame_count={_n_frames} OK for HEARMEMAN")
+
         # 5. Explicit volume.commit() — replaces R.137 watcher. Sync from
         # caller's POV once commit() resolves; subsequent /modal-data/output
         # reads from other containers will see the file.
         try:
-            h3_models_volume.commit()
+            wan22_models_volume.commit()
         except Exception as e:
             # Non-fatal: bytes are already returned to caller; commit is for
             # Volume-level persistence (cross-container reads).
@@ -1269,308 +1534,3 @@ class H3Generator:
         return video_bytes
 
 # =============================================================================
-# DEAD CODE removed (Task #218 / Option A, 2026-09-13):
-#   - `check_job_status(nonce)` — formerly R.119 cold-start-free status reader via
-#     Modal Dict. Killed by Task #130 (2026-09-09) when /api/status inlined
-#     jobs.get(); now doubly dead because Option A eliminates the Dict entirely
-#     and replaces status with `FunctionCall.from_id(call_id).get(timeout=0)`.
-#   - `jobs = modal.Dict.from_name(...)` removed at top of file — see header comment.
-#
-# If you ever need status without result payload, use:
-#   call = FunctionCall.from_id(call_id)
-#   try:
-#       _ = call.get(timeout=0)   # 202 "running" or raises TimeoutError
-#   except TimeoutError:
-#       return {"status": "running", "call_id": call_id}
-#
-# =============================================================================
-# Pre-warm: REMOVED 2026-08-31 (replaced by Modal-native autoscaler above).
-# See B3 → B0 migration notes in MEMORY.
-# =============================================================================
-# Earlier design (B3): a scheduled function that pinged /system_stats every 4 min
-# to keep the GPU container warm. This FAILED in production:
-#   - Default Modal image lacks httpx (ModuleNotFoundError, container scaled down)
-#   - Ping timeout (30-120s) < cold start (110s+) → scheduled ping races cold start
-#   - Cron-style polling is fragile for keeping GPU state alive
-#
-# New design (B0): Modal-native autoscaler on serve() decorator:
-#   - min_containers=0      → no idle cost, pay only for real requests
-#   - scaledown_window=60   → die after 60s idle (serve() /api/run); /view uses 5s
-#   - max_containers=20     → ceiling under burst
-#   - buffer_containers=0   → REMOVED 2026-09-09 (was 1). See serve() comment
-#                             + MEMORY [[modal-buffer-removed-permanently-2026-09-09]].
-# (Modal SDK has no `scaleup_window`; autoscaler reacts to demand growth
-# via its own internal heuristic — typically <1s.)
-#
-# Residual cold-start cost: first request after scaledown pays ~10s
-# (memory snapshot restore, B1 2026-08-31). Mitigation: B1 worker
-# IN_QUEUE_TIMEOUT_MS 10 → 25 min (worker safety net).
-# =============================================================================
-
-
-@app.local_entrypoint()
-def main():
-    log.info("=== Modal ComfyUI H3 app ===")
-    log.info("Setup models:  modal run modal_comfyui_minimax_h3.py::setup_minimax_h3_models --hf-token hf_xxx")
-    log.info("Setup Civitai LoRA: modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli --model-id N --version-id N --file-id N --target-path models/loras/X.safetensors --sha256 ... --civitai-api-key KEY")
-    log.info("Deploy:        modal deploy modal_comfyui_minimax_h3.py")
-    log.info("Autoscaler:    min=0 max=20 buffer=1 scaledown=5s")
-
-
-# =============================================================================
-# Setup job: drop a Civitai LoRA into the same h3_models_volume
-# =============================================================================
-# Idempotent: if the destination already exists AND the SHA256 matches, exits OK.
-# Re-running after the file is in place is a no-op (saves the 296 MB re-download).
-#
-# Why a separate function (vs adding to setup_minimax_h3_models):
-#   - HuggingFace setup is large (~30 GB, 2-hour timeout). Adding/removing a
-#     LoRA should NOT trigger re-download of the whole base model set.
-#   - Idempotency contract differs: HF files are size-gated; LoRAs need
-#     SHA256 verification (community uploads can drift).
-# =============================================================================
-
-CHUNK_SIZE_LORA = 8 * 1024 * 1024  # 8 MiB
-
-
-def _sha256_file(path: str, chunk: int = 8 * 1024 * 1024) -> str:
-    import hashlib as _hashlib
-
-    h = _hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            buf = f.read(chunk)
-            if not buf:
-                break
-            h.update(buf)
-    return h.hexdigest().upper()
-
-
-@app.function(
-    image=image,
-    volumes={"/modal-data": h3_models_volume},
-    cpu=2,
-    memory=4096,
-    timeout=900,
-    startup_timeout=600,
-)
-def setup_civitai_lora(
-    model_id: int,
-    version_id: int,
-    file_id: int,
-    target_path: str,
-    sha256: str,
-    civitai_api_key: str = "",
-) -> dict:
-    """Download a Civitai LoRA into the shared Modal Volume.
-
-    Parameters
-    ----------
-    model_id, version_id, file_id
-        Civitai identifiers — assembled from ``describe-lora`` manifest.
-    target_path
-        Path relative to the ComfyUI models root, e.g.
-        ``"models/loras/MM-H3 - Blowjob v2.1.safetensors"``. The
-        absolute destination is ``/modal-data/<target_path>``.
-    sha256
-        Expected SHA256 (uppercase hex, 64 chars). Verified after
-        download; mismatch aborts and removes the partial file.
-    civitai_api_key
-        Bearer token. Required for NSFW or rate-limited public models.
-        Read from env var CIVITAI_API_KEY if not passed.
-
-    Returns
-    -------
-    dict with status, bytes written, sha256 (computed), path.
-    """
-    import urllib.request
-
-    expected_sha = sha256.strip().upper()
-    assert len(expected_sha) == 64, f"sha256 must be 64 hex chars, got {len(expected_sha)}"
-    target_path = target_path.lstrip("/")
-    dst = f"/modal-data/{target_path}"
-
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-
-    # Idempotency: file present + sha matches → done
-    if os.path.exists(dst):
-        h = _sha256_file(dst)
-        if h == expected_sha:
-            sz = os.path.getsize(dst)
-            log.info(
-                f"setup_civitai_lora: {target_path} already present "
-                f"({sz / 1e6:.1f} MB, sha256 OK)"
-            )
-            return {
-                "status": "ok_already_present",
-                "path": target_path,
-                "sizeBytes": sz,
-                "sha256": h,
-                "modelId": model_id,
-                "versionId": version_id,
-            }
-        log.warning(
-            f"setup_civitai_lora: {target_path} present but sha mismatch "
-            f"(have {h[:12]}… want {expected_sha[:12]}…) — re-downloading"
-        )
-        os.unlink(dst)
-
-    api_key = civitai_api_key or os.environ.get("CIVITAI_API_KEY", "")
-    download_url = (
-        f"https://civitai.com/api/download/models/{version_id}?fileId={file_id}"
-    )
-    # Cloudflare in front of Civitai returns a 403 HTML challenge for the
-    # default `Python-urllib/x.y` User-Agent. Mimic curl to be allowed.
-    headers = {
-        "Accept": "application/octet-stream",
-        "User-Agent": "curl/8.7.1",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    from urllib.parse import urlparse
-
-    # Manual redirect loop — urllib's default HTTPRedirectHandler leaks
-    # the original Authorization header to the redirected host (R2), which
-    # then returns 400 "Missing x-amz-content-sha256" because its signed-URL
-    # auth scheme rejects the leaked Bearer token.
-    #
-    # Solution: install an opener with a redirect handler that RE-RAISES
-    # 30x as HTTPError with the Location header preserved, so urlopen
-    # doesn't auto-follow. Our manual loop then follows with the right
-    # headers (auth stripped on cross-host).
-    class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
-        def http_error_301(self, req, fp, code, msg, headers):
-            return self._raise(req, fp, code, msg, headers)
-        def http_error_302(self, req, fp, code, msg, headers):
-            return self._raise(req, fp, code, msg, headers)
-        def http_error_303(self, req, fp, code, msg, headers):
-            return self._raise(req, fp, code, msg, headers)
-        def http_error_307(self, req, fp, code, msg, headers):
-            return self._raise(req, fp, code, msg, headers)
-        def http_error_308(self, req, fp, code, msg, headers):
-            return self._raise(req, fp, code, msg, headers)
-        def _raise(self, req, fp, code, msg, headers):
-            # Preserve headers on the HTTPError so caller can read Location
-            err = urllib.error.HTTPError(
-                req.full_url, code, msg, headers, fp
-            )
-            raise err
-
-    opener = urllib.request.build_opener(_NoFollowRedirect())
-
-    current_url = download_url
-    current_headers = dict(headers)
-    response = None
-    try:
-        for hop in range(5):  # max 5 hops, Civitai → R2 should be 1
-            req = urllib.request.Request(current_url, headers=current_headers)
-            try:
-                response = opener.open(req, timeout=7200)
-                # 2xx — done
-                break
-            except urllib.error.HTTPError as e:
-                if e.code not in (301, 302, 303, 307, 308):
-                    raise RuntimeError(
-                        f"HTTP {e.code} from {current_url}: {e.reason}"
-                    ) from e
-                location = e.headers.get("Location")
-                if not location:
-                    raise RuntimeError(
-                        f"HTTP {e.code} from {current_url} with no Location"
-                    ) from e
-                # Cross-host: strip Authorization (R2 uses its own sig).
-                new_host = urlparse(location).netloc
-                old_host = urlparse(current_url).netloc
-                if new_host != old_host:
-                    current_headers = {
-                        k: v for k, v in current_headers.items()
-                        if k != "Authorization"
-                    }
-                current_url = location
-                log.info(
-                    f"setup_civitai_lora: redirect hop {hop} → "
-                    f"{urlparse(location).netloc}"
-                )
-                continue
-
-        if response is None or response.status != 200:
-            raise RuntimeError(f"unexpected final status from {current_url}")
-        log.info(f"setup_civitai_lora: downloading {current_url}")
-
-        tmp_path = f"{dst}.part"
-        total = int(response.headers.get("Content-Length", "0") or 0)
-        written = 0
-        with open(tmp_path, "wb") as f:
-            while True:
-                chunk = response.read(CHUNK_SIZE_LORA)
-                if not chunk:
-                    break
-                f.write(chunk)
-                written += len(chunk)
-                if total and written % (32 * CHUNK_SIZE_LORA) < CHUNK_SIZE_LORA:
-                    pct = 100 * written / total
-                    log.info(
-                        f"setup_civitai_lora: {target_path} "
-                        f"{written / 1e6:.1f}/{total / 1e6:.1f} MB ({pct:.1f}%)"
-                    )
-        response.close()
-    except Exception as e:
-        if os.path.exists(f"{dst}.part"):
-            os.unlink(f"{dst}.part")
-        raise RuntimeError(f"download failed: {e}") from e
-
-    computed = _sha256_file(tmp_path)
-    if computed != expected_sha:
-        os.unlink(tmp_path)
-        raise RuntimeError(
-            f"sha256 mismatch: computed {computed[:12]}…, expected {expected_sha[:12]}…"
-        )
-
-    os.replace(tmp_path, dst)
-    sz = os.path.getsize(dst)
-    h3_models_volume.commit()
-    log.info(
-        f"setup_civitai_lora: committed {target_path} "
-        f"({sz / 1e6:.1f} MB, sha256 OK)"
-    )
-
-    return {
-        "status": "ok_downloaded",
-        "path": target_path,
-        "sizeBytes": sz,
-        "sha256": computed,
-        "modelId": model_id,
-        "versionId": version_id,
-    }
-
-
-@app.local_entrypoint()
-def setup_civitai_lora_cli(
-    model_id: int,
-    version_id: int,
-    file_id: int,
-    target_path: str,
-    sha256: str,
-    civitai_api_key: str = "",
-) -> None:
-    """CLI entrypoint. Invoked as::
-
-        modal run modal_comfyui_minimax_h3.py::setup_civitai_lora_cli \\
-            --model-id 2845331 --version-id 3235946 \\
-            --file-id 3118341 \\
-            --target-path "models/loras/MM-H3 - Blowjob v2.1.safetensors" \\
-            --sha256 AEF6D0C6B758352FD4CFE302D3B9121FB0C18E470BDE4BDB2025229E1FEBEE6D \\
-            --civitai-api-key "$CIVITAI_API_KEY"
-    """
-    import json as _json
-
-    result = setup_civitai_lora.remote(
-        model_id=model_id,
-        version_id=version_id,
-        file_id=file_id,
-        target_path=target_path,
-        sha256=sha256,
-        civitai_api_key=civitai_api_key,
-    )
-    print(_json.dumps(result, indent=2))
