@@ -191,15 +191,21 @@ WAN22_FILES = [
         "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
         635_000_000,
     ),
-    # ─── Style B (RIFE 60 FPS): RIFE VFI model, Task #15 (2026-09-27) ───
+    # ─── Style B (RIFE 60 FPS): RIFE VFI model, Task #15 (2026-09-27) + Task #268 ───
     # Fannovel16/ComfyUI-Frame-Interpolation vfi_utils.get_ckpt_container_path
     # returns `<custom_node>/ckpts/rife/` (NOT /ComfyUI/models/<sub>/). The
     # setup_wan22_models worker + the @modal.enter()'s copy loop stages the file
     # there explicitly below.
+    # Task #268 (2026-09-30): GitHub Releases egress is unreliable from Modal
+    # containers — Fannovel16's auto-download silently fails and the executor
+    # bypasses RIFE (Task #173 fail-soft). Swap to HF mirror (proven reachable
+    # for Wan 2.2/Phantom/lightx2v in this same Modal image). SHA-256 verified
+    # in @modal.enter() copy block below — catches silent-truncated-download
+    # failure mode that expected_min gate misses.
     (
         "rife/rife49.pth",
-        "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/rife49.pth",
-        21_000_000,
+        "https://huggingface.co/marduk191/rife/resolve/main/rife49.pth",
+        21_300_000,
     ),
 ]
 
@@ -505,8 +511,29 @@ class WanGenerator:
                 log.info(f"[INSTR_RIFE] staged {rife_ckpt_src} -> {rife_ckpt_dst}")
             else:
                 log.info(f"[INSTR_RIFE] already staged at {rife_ckpt_dst}")
+            # Task #268 (2026-09-30): SHA-256 verify catches silent-truncated-download
+            # failure mode (file exists + passes expected_min gate but content is garbage).
+            # Hardcoded SHA from Fannovel16 release — 21,345,274 bytes, verified by hand.
+            # Raises RuntimeError on mismatch → container fails to boot LOUDLY with a
+            # clear remediation hint, instead of silently serving 16 FPS videos.
+            import hashlib
+            _RIFE_SHA256 = "e55fd00f3cc184e3c65961f4bb827a9da022e78eed36b055242c0ac30000d533"
+            with open(rife_ckpt_dst, "rb") as _f:
+                _actual_sha = hashlib.sha256(_f.read()).hexdigest()
+            if _actual_sha != _RIFE_SHA256:
+                raise RuntimeError(
+                    f"rife49.pth SHA mismatch at {rife_ckpt_dst}: "
+                    f"got {_actual_sha}, expected {_RIFE_SHA256}. "
+                    f"Re-run `modal run modal_comfyui_wan22.py::setup_wan22_models "
+                    f"--hf-token hf_xxx` to re-bake from HF mirror."
+                )
+            log.info(f"[INSTR_RIFE] SHA verified {_actual_sha[:12]}...")
         else:
-            log.warning(f"[INSTR_RIFE] NOT FOUND: {rife_ckpt_src} — RIFE VFI may fall back to GitHub download at request-time")
+            log.warning(
+                f"[INSTR_RIFE] NOT FOUND: {rife_ckpt_src} — RIFE VFI may fall back "
+                f"to GitHub download at request-time. Task #268 frame-count assert "
+                f"in _run_workflow will surface silent-bypass as a hard error."
+            )
 
         # Task #29 (2026-09-27): PATCH RIFE VFI custom_node line 238 — fix CPU/CUDA
         # tensor mismatch in torch.cat(output_frames). Root cause: RIFE accumulates
@@ -1346,20 +1373,86 @@ class WanGenerator:
             raise RuntimeError(f"ComfyUI poll timeout for prompt_id={prompt_id}")
 
         # 3. Find output file. ComfyUI stores outputs in hist["outputs"][node_id]["videos"|"images"].
+        # Task #268 PR1.5 (2026-09-30): prefer outputs with non-empty subfolder.
+        # Mirrors the worker picker fix (apps/worker/src/providers/modal-comfyui.provider.ts:3424).
+        # RIFE-VFI post-process nodes write to subdirs like "Hunyuan/videos/30/"
+        # (final 60 FPS MP4), intermediate VideoCombine nodes (Wan 2.2 teacache)
+        # write to the root output dir with empty subfolder. Without this
+        # preference, _run_workflow would pick the teacache intermediate first
+        # (insertion order), upload 16 FPS bytes to S3, and the frame-count
+        # assertion below (which requires out_subfolder=="Hunyuan/videos/30")
+        # would never fire.
+        #
+        # Task #268 PR1.5b (2026-09-30): VHS_VideoCombine with a custom
+        # filename_prefix like "Hunyuan/videos/30/vid" BYPASSES ComfyUI history
+        # tracking entirely — the file is on disk but hist["outputs"] does NOT
+        # list it. In that case the history-based picker above can only see
+        # the intermediate (teacache) node. Override the empty-subfolder pick
+        # by scanning /modal-data/output/ recursively for a subfolder'd MP4.
+        # This is the filesystem equivalent of the worker picker preference.
         outputs = hist.get("outputs", {})
         out_filename = None
         out_subfolder = ""
         out_type = "output"
+        preferred = None  # (filename, subfolder, type) with non-empty subfolder
+        first_hit = None  # fallback for workflows without subfolder'd outputs
         for node_out in outputs.values():
             for kind in ("videos", "images", "gifs"):
-                if kind in node_out and node_out[kind]:
-                    first = node_out[kind][0]
-                    out_filename = first.get("filename")
-                    out_subfolder = first.get("subfolder", "")
-                    out_type = first.get("type", "output")
-                    break
-            if out_filename:
-                break
+                if not (kind in node_out and node_out[kind]):
+                    continue
+                for entry in node_out[kind]:
+                    _fn = entry.get("filename")
+                    if not _fn:
+                        continue
+                    _sub = entry.get("subfolder", "")
+                    _typ = entry.get("type", "output")
+                    _hit = (_fn, _sub, _typ)
+                    if _sub and preferred is None:
+                        preferred = _hit
+                    elif first_hit is None:
+                        first_hit = _hit
+        chosen = preferred or first_hit
+        if chosen:
+            out_filename, out_subfolder, out_type = chosen
+
+        # VHS_VideoCombine bypass: if history yielded an empty-subfolder file
+        # AND a subfolder'd MP4 exists on disk (e.g. from a VHS_VideoCombine
+        # node with filename_prefix="Hunyuan/videos/30/vid" that bypasses
+        # history tracking), prefer the subfolder'd file. Catches the case
+        # where the final-output VHS_VideoCombine isn't visible to the
+        # history-based picker at all. Newest mtime wins.
+        if not out_subfolder:
+            _override = None
+            _root = "/modal-data/output"
+            try:
+                for entry in os.scandir(_root):
+                    if not entry.is_dir():
+                        continue
+                    try:
+                        _cands = [
+                            f for f in os.listdir(entry.path)
+                            if f.endswith(".mp4") and os.path.isfile(os.path.join(entry.path, f))
+                        ]
+                    except OSError:
+                        continue
+                    for f in _cands:
+                        p = os.path.join(entry.path, f)
+                        try:
+                            m = os.path.getmtime(p)
+                        except OSError:
+                            continue
+                        if _override is None or m > _override[0]:
+                            _override = (m, entry.name, f)
+            except FileNotFoundError:
+                pass
+            if _override is not None:
+                _, _sub, _fn = _override
+                log.info(
+                    f"_run_workflow: VHS_VideoCombine bypass override "
+                    f"({out_filename!r} -> {_sub}/{_fn})"
+                )
+                out_filename = _fn
+                out_subfolder = _sub
 
         if not out_filename:
             raise RuntimeError(
@@ -1398,6 +1491,35 @@ class WanGenerator:
         with open(out_path, "rb") as f:
             video_bytes = f.read()
         log.info(f"_run_workflow nonce={nonce} read {len(video_bytes)} bytes from {out_path}")
+
+        # Task #268 (2026-09-30): Frame-count assertion for HEARMEMAN RIFE workflows.
+        # HEARMEMAN workflow writes its RIFE-finalized output to subfolder
+        # "Hunyuan/videos/30" (per VHS_VideoCombine node 94 filename_prefix
+        # "Hunyuan/videos/30/vid"). At multiplier=4 over 81 input frames we
+        # expect ~321 output frames @ 60 FPS. The earlier in-graph RIFE VFI
+        # node (Task #173 fail-soft) silently bypassed on missing model and
+        # served 81-frame 16 FPS video under "60 FPS" metadata — this
+        # assertion surfaces that bug as a hard error instead.
+        # Cost: CAP_PROP_FRAME_COUNT is O(1) (reads mp4 header, no decode).
+        if out_subfolder == "Hunyuan/videos/30":
+            import cv2
+            _cap = cv2.VideoCapture(out_path)
+            _n_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            _cap.release()
+            # 280-360 covers actual HEARMEMAN output: 290 input × multiplier=4
+            # capped by VHS_VideoCombine to ~5s @ 60 FPS (~297 frames, observed
+            # 2026-09-30 PR1 verification). Narrower 300-340 window caused false
+            # positives on healthy generations.
+            if not (280 <= _n_frames <= 360):
+                raise RuntimeError(
+                    f"RIFE bypassed: HEARMEMAN output has {_n_frames} frames, "
+                    f"expected ~321 (300-340 window for multiplier=4 over ~80-85 input). "
+                    f"out_path={out_path}. Likely cause: rife49.pth missing from "
+                    f"/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/ckpts/rife/ "
+                    f"and GitHub auto-download failed (Task #173 fail-soft). "
+                    f"Check Modal app logs for `[INSTR_RIFE] NOT FOUND`."
+                )
+            log.info(f"[INSTR_RIFE] frame_count={_n_frames} OK for HEARMEMAN")
 
         # 5. Explicit volume.commit() — replaces R.137 watcher. Sync from
         # caller's POV once commit() resolves; subsequent /modal-data/output
