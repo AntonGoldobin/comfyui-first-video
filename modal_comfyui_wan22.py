@@ -650,6 +650,77 @@ class WanGenerator:
                 else:
                     log.warning(f"[INSTR_RIFE_TRACEBACK_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
 
+            # Task #268 Tier-4c (2026-10-01): convert the 6-positional
+            # interpolation_model(...) call to keyword arguments.
+            # Root cause: vfi() upstream line 200 calls
+            #   interpolation_model(frame0_batch, frame1_batch, timestep_tensor,
+            #                       scale_list, fast_mode, ensemble)
+            # but Tier-4/4b runtime wrappers (IFNet class monkey-patch + module
+            # interpolation_model attr swap) never fire on the warm container —
+            # yet the call STILL errors with "IFNet.forward() takes from 3 to 9
+            # positional arguments but 13 were given". 13 - 6 - 1 (self) = 6
+            # extra positional args are being injected somewhere we can't see.
+            # Explicit kwargs match by NAME (not position) — survives ANY
+            # positional-arg wrapper, IFNet.forward signature drift, and any
+            # torch.compile / wrapper class that prepends args. ponytail: ceiling
+            # is upstream IFNet.forward param rename — bump kwarg set if it
+            # adds required kwargs (e.g. `arch_ver`).
+            _kwargs_marker = "# RIFE_PATCH_2026_10_01 kwargs to bypass positional arg-count"
+            if _kwargs_marker not in _rife_src:
+                # Match the 6-arg block exactly as the Tier-2 traceback patch
+                # emits it (20-space indent inside the try block).
+                _args_old = (
+                    "                    frame0_batch,\n"
+                    "                    frame1_batch,\n"
+                    "                    timestep_tensor,\n"
+                    "                    scale_list,\n"
+                    "                    fast_mode,\n"
+                    "                    ensemble,\n"
+                )
+                _args_new = (
+                    "                    frame0_batch,\n"
+                    "                    frame1_batch,\n"
+                    "                    timestep=timestep_tensor,\n"
+                    "                    scale_list=scale_list,\n"
+                    "                    fastmode=fast_mode,\n"
+                    "                    ensemble=ensemble,\n"
+                )
+                if _args_old in _rife_src:
+                    _rife_src = _rife_src.replace(_args_old, _args_new, 1)
+                    log.info(f"[INSTR_RIFE_KWARGS_PATCH] converted interpolation_model call to keyword arguments in {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_KWARGS_PATCH] 6-arg block not found in {rife_init_py} — Tier-2 patch may not have run or upstream drifted")
+
+            # Task #268 Tier-4d (2026-10-01): print IFNet.forward signature at
+            # runtime, ONCE per container, so we can see in /tmp/comfy.log what
+            # the actual installed IFNet.forward expects (co_argcount + first
+            # few co_varnames). Goal: confirm or refute whether the upstream
+            # 8-arg signature is what the warm container actually has. Insert
+            # a one-shot log right after the IFNet import.
+            _sig_marker = "# RIFE_PATCH_2026_10_01 signature log"
+            if _sig_marker not in _rife_src:
+                _sig_old = "        from .rife_arch import IFNet"
+                _sig_new = (
+                    "        from .rife_arch import IFNet\n"
+                    f"{_sig_marker}\n"
+                    "        import sys as _sig_sys\n"
+                    "        try:\n"
+                    "            _sig_code = IFNet.forward.__code__\n"
+                    "            _sig_sys.stdout.write(\n"
+                    "                f\"[INSTR_RIFE_SIG] IFNet.forward co_argcount={_sig_code.co_argcount} \"\n"
+                    "                f\"varnames[:9]={list(_sig_code.co_varnames[:9])} \"\n"
+                    "                f\"kwonly={_sig_code.co_kwonlyargcount}\\n\"\n"
+                    "            )\n"
+                    "        except Exception as _sig_e:\n"
+                    "            _sig_sys.stdout.write(f\"[INSTR_RIFE_SIG] failed: {_sig_e}\\n\")\n"
+                    "        _sig_sys.stdout.flush()"
+                )
+                if _sig_old in _rife_src:
+                    _rife_src = _rife_src.replace(_sig_old, _sig_new, 1)
+                    log.info(f"[INSTR_RIFE_SIG_PATCH] applied signature log to {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_SIG_PATCH] IFNet import line not found in {rife_init_py}")
+
             # Persist whatever we patched to disk (idempotent — both markers above
             # ensure re-runs are no-ops).
             with open(rife_init_py, "w") as _f:
