@@ -593,6 +593,63 @@ class WanGenerator:
                 else:
                     log.warning(f"[INSTR_RIFE_DEBUG_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
 
+            # Task #268 Tier-2 (2026-09-30): wrap `interpolation_model(...)` call
+            # in try/except that logs the FULL Python traceback to stdout
+            # (flows into /tmp/comfy.log via the symlink installed earlier in
+            # this @enter block). Without this, a RIFE exception silently kills
+            # the call and ComfyUI's fail-soft executor treats the node as
+            # "invalid (no error attached)" — downstream node 94 never runs,
+            # frame_count assertion fires but with NO ROOT CAUSE visible.
+            _trace_marker = "# RIFE_PATCH_2026_09_30 traceback on interpolation_model failure"
+            if _trace_marker not in _rife_src:
+                # The exact upstream line is (indented 16 spaces inside vfi()
+                # batching loop). Match the LHS assignment prefix to disambiguate
+                # from any future code that might call interpolation_model elsewhere.
+                _trace_old = "                middle_frames = interpolation_model("
+                _trace_new = (
+                    f"{_trace_marker}\n"
+                    "                import traceback as _tb268, sys as _sys268\n"
+                    "                try:\n"
+                    "                    middle_frames = interpolation_model("
+                )
+                if _trace_old in _rife_src:
+                    _rife_src = _rife_src.replace(_trace_old, _trace_new, 1)
+                    # Now wrap the 6-arg call + the chained `.clamp(0, 1).detach().cpu()`
+                    # in a corresponding except. Find the closing `).clamp(0, 1).detach().cpu()`
+                    # line that ends the original assignment.
+                    _chain_old = "                ).clamp(0, 1).detach().cpu()"
+                    _chain_new = (
+                        "                    frame0_batch,\n"
+                        "                    frame1_batch,\n"
+                        "                    timestep_tensor,\n"
+                        "                    scale_list,\n"
+                        "                    fast_mode,\n"
+                        "                    ensemble,\n"
+                        "                ).clamp(0, 1).detach().cpu()\n"
+                        "                except Exception as _rife_exc:\n"
+                        "                    _sys268.stdout.write(\n"
+                        "                        f\"[INSTR_RIFE_FAIL] ckpt_name={ckpt_name!r} \"\n"
+                        "                        f\"multiplier={multiplier!r} \"\n"
+                        "                        f\"frames.shape={tuple(frames.shape) if hasattr(frames,'shape') else 'NA'} \"\n"
+                        "                        f\"frames.device={getattr(frames,'device','NA')} \"\n"
+                        "                        f\"dtype={dtype!r} exc_type={type(_rife_exc).__name__}\\n\"\n"
+                        "                    )\n"
+                        "                    _tb268.print_exception(type(_rife_exc), _rife_exc, _rife_exc.__traceback__)\n"
+                        "                    _sys268.stdout.flush()\n"
+                        "                    raise"
+                    )
+                    if _chain_old in _rife_src:
+                        _rife_src = _rife_src.replace(_chain_old, _chain_new, 1)
+                        log.info(f"[INSTR_RIFE_TRACEBACK_PATCH] applied try/except traceback wrapper to {rife_init_py}")
+                    else:
+                        # Pattern upstream drifted — fall back to NO-OP shim so we
+                        # at least don't make things worse. Caller will see a warning.
+                        log.warning(f"[INSTR_RIFE_TRACEBACK_PATCH] chain-closing line not found in {rife_init_py} — aborting wrapper insertion")
+                        # Roll back the partial replace so the file is consistent.
+                        _rife_src = _rife_src.replace(_trace_new, _trace_old, 1)
+                else:
+                    log.warning(f"[INSTR_RIFE_TRACEBACK_PATCH] target line not found in {rife_init_py} — pattern may have changed upstream")
+
             # Persist whatever we patched to disk (idempotent — both markers above
             # ensure re-runs are no-ops).
             with open(rife_init_py, "w") as _f:
@@ -611,7 +668,9 @@ class WanGenerator:
             try:
                 import importlib
                 import sys as _sys
-                _sys.path.insert(0, "/ComfyUI/custom_nodes")
+                for _p in ("/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation", "/ComfyUI"):
+                    if _p not in _sys.path:
+                        _sys.path.insert(0, _p)
                 import vfi_models.rife as _rife_mod
                 importlib.reload(_rife_mod)
                 # Re-publish on the parent package registry so ComfyUI's
@@ -619,6 +678,9 @@ class WanGenerator:
                 import vfi_models as _vm
                 _vm.rife = _rife_mod
                 log.info(f"[INSTR_RIFE_RELOAD] forced module reload of {rife_init_py}")
+                # NOTE: IFNet.forward runtime adapter now installed in _run_workflow
+                # (Task #268 Tier-4 retry, 2026-10-01) because vfi_models.rife is not
+                # importable at @enter() time (ComfyUI custom_nodes not yet loaded).
             except Exception as _reload_err:
                 log.warning(f"[INSTR_RIFE_RELOAD] skipped (module not yet importable): {_reload_err}")
         else:
@@ -908,6 +970,22 @@ class WanGenerator:
         # is slower because VAE/CLIP re-encode every call (instead of cached). But
         # the alternative is 33-100% warm-fail rate. Acceptable since most real
         # traffic is cold-after-idle (Modal scales down containers after ~5min).
+        # Task #268 (2026-09-30): surface ComfyUI execution logs to Modal stdout.
+        # Without this, custom-node exceptions (e.g. RIFE VFI silent fail-soft
+        # per comfyui-executor-silent-bypass-2026-09-27) are written ONLY to
+        # /tmp/comfy.log, which the script doesn't tail after setup().
+        # Symlink → PID 1 fd 1 (Modal container stdout) so FileHandler output
+        # flows into `modal app logs`. Zero risk, high signal.
+        try:
+            if os.path.exists("/tmp/comfy.log") or os.path.islink("/tmp/comfy.log"):
+                os.unlink("/tmp/comfy.log")
+        except FileNotFoundError:
+            pass
+        try:
+            os.symlink("/proc/1/fd/1", "/tmp/comfy.log")
+            log.info("[INSTR_COMFYLOG] /tmp/comfy.log → /proc/1/fd/1 (Modal stdout)")
+        except FileExistsError:
+            pass
         import httpx as _httpx
         log_file = open("/tmp/comfy.log", "w")
         self._proc = subprocess.Popen(
@@ -1332,6 +1410,62 @@ class WanGenerator:
             )
         except Exception as _prompt_dbg_err:
             log.warning(f"[INSTR_PROMPT_DEBUG] failed: {_prompt_dbg_err}")
+
+        # Task #268 Tier-4 retry (2026-10-01): install IFNet.forward adapter at
+        # runtime. Previous attempt at @enter() failed because ComfyUI's custom_nodes
+        # aren't yet importable during the model-copy phase (No module named 'vfi_models').
+        # By the time _run_workflow executes, ComfyUI server has booted and
+        # vfi_models.rife.rife_arch.IFNet is fully loaded — safe to monkey-patch.
+        try:
+            import sys as _sys_rt
+            # vfi_models lives in /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation/
+            # (NOT /ComfyUI/custom_nodes/ root — that's just the parent dir).
+            # Also need /ComfyUI itself on sys.path because rife_arch.py imports
+            # `comfy.model_management.get_torch_device` at module load.
+            _rife_pkg_dir = "/ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation"
+            _comfy_root = "/ComfyUI"
+            for _p in (_rife_pkg_dir, _comfy_root):
+                if _p not in _sys_rt.path:
+                    _sys_rt.path.insert(0, _p)
+            from vfi_models.rife.rife_arch import IFNet as _IFNet_rt
+            _adapter_marker_rt = "_INSTR_RIFE_ADAPTER_APPLIED_2026_10_01"
+            if not getattr(_IFNet_rt, _adapter_marker_rt, False):
+                _orig_forward_rt = _IFNet_rt.forward
+                def _safe_forward_rt(self, *args, **kwargs):
+                    import torch as _torch_rt
+                    _tensors = [a for a in args if _torch_rt.is_tensor(a)]
+                    _lists = [a for a in args if isinstance(a, list)]
+                    _bools = [a for a in args if isinstance(a, bool)]
+                    log.info(
+                        f"[INSTR_RIFE_ADAPTER_RT] IFNet.forward called with "
+                        f"{len(args)} args ({len(_tensors)} tensors, {len(_lists)} lists, "
+                        f"{len(_bools)} bools, {len(kwargs)} kwargs)"
+                    )
+                    if len(_tensors) >= 3 and len(_lists) >= 1:
+                        img0, img1, timestep = _tensors[0], _tensors[1], _tensors[2]
+                        scale_list = _lists[0]
+                        training = _bools[0] if len(_bools) > 0 else False
+                        fastmode = _bools[1] if len(_bools) > 1 else False
+                        ensemble = _bools[2] if len(_bools) > 2 else False
+                        return_flow = _bools[3] if len(_bools) > 3 else False
+                        return _orig_forward_rt(
+                            self, img0, img1, timestep=timestep,
+                            scale_list=scale_list, training=training,
+                            fastmode=fastmode, ensemble=ensemble,
+                            return_flow=return_flow,
+                        )
+                    return _orig_forward_rt(self, *args, **kwargs)
+                _IFNet_rt.forward = _safe_forward_rt
+                setattr(_IFNet_rt, _adapter_marker_rt, True)
+                log.info(
+                    f"[INSTR_RIFE_ADAPTER_RT] IFNet.forward wrapped (orig signature: "
+                    f"{len(_orig_forward_rt.__code__.co_varnames)} params, "
+                    f"file={_orig_forward_rt.__code__.co_filename})"
+                )
+            else:
+                log.info("[INSTR_RIFE_ADAPTER_RT] IFNet.forward already wrapped (warm container)")
+        except Exception as _adapter_rt_err:
+            log.warning(f"[INSTR_RIFE_ADAPTER_RT] could not install: {_adapter_rt_err}")
 
         body = {"prompt": workflow_json, "client_id": client_id}
         r = _httpx.post(
