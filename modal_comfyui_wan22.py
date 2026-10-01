@@ -33,6 +33,7 @@ Deploy:
 """
 
 import os
+import pathlib
 import time
 import threading
 import logging
@@ -1695,8 +1696,16 @@ class WanGenerator:
         out_filename = None
         out_subfolder = ""
         out_type = "output"
-        preferred = None  # (filename, subfolder, type) with non-empty subfolder
-        first_hit = None  # fallback for workflows without subfolder'd outputs
+        preferred = None  # latest (filename, subfolder, type) with non-empty subfolder
+        last_hit = None  # latest regardless of subfolder (fallback)
+        # Task #268 Tier-4f (2026-10-01): replace first_hit (locks at first
+        # occurrence) with last_hit (updated each iteration) so that when no
+        # subfolder'd output exists, the LAST output wins. Previously, if
+        # iteration order was teacache-first (node 80) then rife_60fps (node 94)
+        # and both had empty subfolder, the picker returned teacache and the
+        # 60 FPS final was discarded. Iteration order = outputs dict insertion
+        # order = execution order, which is workflow-definition order for
+        # ComfyUI. Final-output nodes run LAST.
         for node_out in outputs.values():
             for kind in ("videos", "images", "gifs"):
                 if not (kind in node_out and node_out[kind]):
@@ -1708,11 +1717,10 @@ class WanGenerator:
                     _sub = entry.get("subfolder", "")
                     _typ = entry.get("type", "output")
                     _hit = (_fn, _sub, _typ)
-                    if _sub and preferred is None:
-                        preferred = _hit
-                    elif first_hit is None:
-                        first_hit = _hit
-        chosen = preferred or first_hit
+                    if _sub:
+                        preferred = _hit  # keep latest with subfolder
+                    last_hit = _hit  # keep latest regardless
+        chosen = preferred or last_hit
         if chosen:
             out_filename, out_subfolder, out_type = chosen
 
@@ -1722,28 +1730,30 @@ class WanGenerator:
         # history tracking), prefer the subfolder'd file. Catches the case
         # where the final-output VHS_VideoCombine isn't visible to the
         # history-based picker at all. Newest mtime wins.
+        #
+        # Task #268 Tier-4f (2026-10-01): replace shallow os.scandir + os.listdir
+        # (1 level deep) with pathlib.Path.rglob — HEARMEMAN writes
+        # vid_*.mp4 to /modal-data/output/Hunyuan/videos/30/ (3 levels deep),
+        # the previous 1-level scan only saw /Hunyuan/videos/ (no MP4s there)
+        # and fell through to the teacache first_hit from history. The 3-deep
+        # path is below 'Hunyuan/videos/30/' which is exactly the subfolder
+        # the picker needs to surface. Newest mtime wins.
         if not out_subfolder:
             _override = None
-            _root = "/modal-data/output"
+            _root = pathlib.Path("/modal-data/output")
             try:
-                for entry in os.scandir(_root):
-                    if not entry.is_dir():
+                for _p in _root.rglob("*.mp4"):
+                    if not _p.is_file():
                         continue
                     try:
-                        _cands = [
-                            f for f in os.listdir(entry.path)
-                            if f.endswith(".mp4") and os.path.isfile(os.path.join(entry.path, f))
-                        ]
+                        m = _p.stat().st_mtime
                     except OSError:
                         continue
-                    for f in _cands:
-                        p = os.path.join(entry.path, f)
-                        try:
-                            m = os.path.getmtime(p)
-                        except OSError:
-                            continue
-                        if _override is None or m > _override[0]:
-                            _override = (m, entry.name, f)
+                    _rel = _p.relative_to(_root)  # e.g. Hunyuuan/videos/30/vid_00001.mp4
+                    _sub = str(_rel.parent) if str(_rel.parent) != "." else ""
+                    _fn = _p.name
+                    if _override is None or m > _override[0]:
+                        _override = (m, _sub, _fn)
             except FileNotFoundError:
                 pass
             if _override is not None:
