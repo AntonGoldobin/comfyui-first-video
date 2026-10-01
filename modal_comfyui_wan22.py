@@ -1464,6 +1464,68 @@ class WanGenerator:
                 )
             else:
                 log.info("[INSTR_RIFE_ADAPTER_RT] IFNet.forward already wrapped (warm container)")
+
+            # Task #268 Tier-4b (2026-10-01): Tier-4 patched _IFNet_rt.forward but the
+            # wrapper was never invoked in E2E — diagnostic confirmed the call goes to a
+            # DIFFERENT class object than the one our import yielded. Bulletproof fix:
+            # replace `vfi_models.rife.interpolation_model` itself (the callable at
+            # line 214 of comfyui-frame-interpolation/vfi_models/rife/__init__.py)
+            # in the module's namespace. Every reference to `interpolation_model` from
+            # any consumer goes through our wrapper regardless of class identity.
+            # On TypeError (12-arg regression where IFNet.forward accepts at most 8
+            # user args), retry with the canonical 8 by type so RIFE keeps running.
+            try:
+                import vfi_models.rife as _vfi_rife_mod
+                if hasattr(_vfi_rife_mod, "interpolation_model") and \
+                   not getattr(_vfi_rife_mod, "_INSTR_INTERP_WRAPPED_2026_10_01", False):
+                    _orig_interp = _vfi_rife_mod.interpolation_model
+                    def _safe_interp_rt(*args, **kwargs):
+                        import torch as _torch_rt2
+                        log.info(
+                            f"[INSTR_RIFE_ADAPTER_RT] interpolation_model called with "
+                            f"{len(args)} args, {len(kwargs)} kwargs"
+                        )
+                        try:
+                            return _orig_interp(*args, **kwargs)
+                        except TypeError as _te:
+                            # Canonical IFNet.forward signature = 8 user args
+                            # (img0, img1, timestep, scale_list, training, fastmode,
+                            # ensemble, return_flow). Some comfyui-frame-interpolation
+                            # forks pass 12+ positional args → TypeError. Retry with
+                            # canonical 8 by type, drop the rest.
+                            # ponytail: silently drops extra positional args — ceiling
+                            # is "only 8 semantic knobs in IFNet.forward"; upgrade path
+                            # is to identify & propagate the new args (padding_mode,
+                            # align_corners, etc.) once comfyui-frame-interpolation's
+                            # vfi() caller is documented.
+                            _tensors = [a for a in args if _torch_rt2.is_tensor(a)]
+                            _lists = [a for a in args if isinstance(a, list)]
+                            _bools = [a for a in args if isinstance(a, bool)]
+                            if len(_tensors) >= 3 and len(_lists) >= 1:
+                                log.info(
+                                    f"[INSTR_RIFE_ADAPTER_RT] retrying with canonical "
+                                    f"8 args ({len(_tensors)}t, {len(_lists)}l, "
+                                    f"{len(_bools)}b) after TypeError: {_te}"
+                                )
+                                return _orig_interp(
+                                    _tensors[0], _tensors[1], _tensors[2],
+                                    _lists[0],
+                                    training=_bools[0] if len(_bools) > 0 else False,
+                                    fastmode=_bools[1] if len(_bools) > 1 else False,
+                                    ensemble=_bools[2] if len(_bools) > 2 else False,
+                                    return_flow=_bools[3] if len(_bools) > 3 else False,
+                                )
+                            raise
+                    _vfi_rife_mod.interpolation_model = _safe_interp_rt
+                    setattr(_vfi_rife_mod, "_INSTR_INTERP_WRAPPED_2026_10_01", True)
+                    log.info(
+                        f"[INSTR_RIFE_ADAPTER_RT] interpolation_model wrapped "
+                        f"(orig type: {type(_orig_interp).__name__})"
+                    )
+                else:
+                    log.info("[INSTR_RIFE_ADAPTER_RT] interpolation_model already wrapped (warm container)")
+            except Exception as _interp_wrap_err:
+                log.warning(f"[INSTR_RIFE_ADAPTER_RT] interpolation_model wrap failed: {_interp_wrap_err}")
         except Exception as _adapter_rt_err:
             log.warning(f"[INSTR_RIFE_ADAPTER_RT] could not install: {_adapter_rt_err}")
 
