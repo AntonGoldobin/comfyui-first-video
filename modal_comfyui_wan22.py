@@ -721,6 +721,40 @@ class WanGenerator:
                 else:
                     log.warning(f"[INSTR_RIFE_SIG_PATCH] IFNet import line not found in {rife_init_py}")
 
+            # Task #268 Tier-4e (2026-10-01): REMOVE the duplicate 6-arg block
+            # created by Tier-2 _chain_new bug. Tier-2 _chain_new replaces the
+            # closing paren `).clamp(...)` with `args + ).clamp(...) + except`
+            # but the ORIGINAL args at lines 201-206 are left untouched, so we
+            # end up with TWO 6-arg blocks between `interpolation_model(` and
+            # `).clamp(...)`. The call then passes 12 positional args
+            # (6 + 6) + self = 13 → "IFNet.forward() takes from 3 to 9
+            # positional arguments but 13 were given". This is the root cause
+            # Tier-4 / 4b runtime wrappers couldn't intercept — the bug is at
+            # parse time, not at runtime. Tier-4e drops the SECOND args block
+            # (the _chain_new duplicate) so only the Tier-4c kwargs block
+            # remains.
+            _dedupe_marker = "# RIFE_PATCH_2026_10_01 dedupe Tier-2 args"
+            if _dedupe_marker not in _rife_src:
+                _dedupe_old = (
+                    "                    ensemble=ensemble,\n"
+                    "                    frame0_batch,\n"
+                    "                    frame1_batch,\n"
+                    "                    timestep_tensor,\n"
+                    "                    scale_list,\n"
+                    "                    fast_mode,\n"
+                    "                    ensemble,\n"
+                    "                ).clamp(0, 1).detach().cpu()"
+                )
+                _dedupe_new = (
+                    "                    ensemble=ensemble,\n"
+                    "                ).clamp(0, 1).detach().cpu()"
+                )
+                if _dedupe_old in _rife_src:
+                    _rife_src = _rife_src.replace(_dedupe_old, _dedupe_new, 1)
+                    log.info(f"[INSTR_RIFE_DEDUPE_PATCH] removed duplicate 6-arg block in {rife_init_py}")
+                else:
+                    log.warning(f"[INSTR_RIFE_DEDUPE_PATCH] duplicate args pattern not found in {rife_init_py} — already deduped or pattern drifted")
+
             # Persist whatever we patched to disk (idempotent — both markers above
             # ensure re-runs are no-ops).
             with open(rife_init_py, "w") as _f:
