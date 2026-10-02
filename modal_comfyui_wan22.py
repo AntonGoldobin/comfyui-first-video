@@ -192,6 +192,21 @@ WAN22_FILES = [
         "https://huggingface.co/lightx2v/Wan2.2-Distill-Loras/resolve/main/wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
         635_000_000,
     ),
+    # ─── NSFW LoRA pair (Task #66: Hearmeman + NSFW 60 FPS) ────────────────────
+    # CivitAI 2149593 (HIGH, 1945 upvotes) + 2149614 (LOW, 567 upvotes).
+    # Creator note: "works at strength 1 without requiring a general NSFW LoRA".
+    # Supports POV + third-person. 4 LoRAs total per chain (LoRA merge is a single
+    # matmul before sampling → no wall-clock overhead vs 2-LoRA chain).
+    (
+        "loras/WAN-2.2-I2V-HandjobBlowjobCombo-HIGH-v1.safetensors",
+        "https://civitai.com/api/download/models/2149593?fileId=2043052",
+        582_000_000,  # 5% tolerance under real 613 MB — matches line 188 pattern
+    ),
+    (
+        "loras/WAN-2.2-I2V-HandjobBlowjobCombo-LOW-v1.safetensors",
+        "https://civitai.com/api/download/models/2149614?fileId=2043063",
+        582_000_000,
+    ),
     # ─── Style B (RIFE 60 FPS): RIFE VFI model, Task #15 (2026-09-27) + Task #268 ───
     # Fannovel16/ComfyUI-Frame-Interpolation vfi_utils.get_ckpt_container_path
     # returns `<custom_node>/ckpts/rife/` (NOT /ComfyUI/models/<sub>/). The
@@ -214,16 +229,26 @@ WAN22_FILES = [
 @app.function(
     image=image,
     volumes={"/modal-data": wan22_models_volume},
+    secrets=[modal.Secret.from_name("civitai-api-key")],
     cpu=4,
     memory=8192,
     timeout=7200,
     startup_timeout=600,
 )
 def setup_wan22_models(hf_token: str = "") -> dict:
-    """Download Wan 2.1 + Phantom model set to Modal Volume. Idempotent. Total ~22 GB for Style A."""
+    """Download Wan 2.1 + Phantom model set to Modal Volume. Idempotent. Total ~22 GB for Style A.
+
+    Task #66 (2026-10-02): CivitAI LoRAs (WAN-2.2-I2V-HandjobBlowjobCombo HIGH+LOW) added to WAN22_FILES.
+    CivitAI returns 401 without auth — read CIVITAI_API_KEY from Modal Secret and add Bearer header
+    for civitai.com URLs. Reuses the redirect-strip pattern from
+    modal_comfyui_minimax_h3.py::setup_civitai_lora: cross-host redirect to R2 must strip
+    Authorization (R2's signed-URL auth rejects the leaked Bearer token → 400).
+    """
     os.environ["HF_TOKEN"] = hf_token
+    civitai_key = os.environ.get("CIVITAI_API_KEY", "")
     import urllib.request
-    hdr = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    import urllib.error
+    from urllib.parse import urlparse
 
     if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
         os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
@@ -236,18 +261,81 @@ def setup_wan22_models(hf_token: str = "") -> dict:
             log.info(f"{rel_path}: already present ({os.path.getsize(dst)/1e9:.2f} GB)")
             continue
         log.info(f"Downloading {rel_path} from {url}")
-        req = urllib.request.Request(url, headers=hdr)
-        try:
+        is_civitai = "civitai.com" in urlparse(url).netloc
+        if is_civitai:
+            # CivitAI: needs Bearer auth + manual redirect loop (auto-follow
+            # leaks Authorization to R2 → 400). Mirrors setup_civitai_lora in H3.
+            if not civitai_key:
+                raise RuntimeError(
+                    f"{rel_path}: civitai.com URL but CIVITAI_API_KEY not set"
+                )
+
+            class _NoFollow(urllib.request.HTTPRedirectHandler):
+                def http_error_301(self, req, fp, code, msg, headers):
+                    return self._raise(req, fp, code, msg, headers)
+                def http_error_302(self, req, fp, code, msg, headers):
+                    return self._raise(req, fp, code, msg, headers)
+                def http_error_303(self, req, fp, code, msg, headers):
+                    return self._raise(req, fp, code, msg, headers)
+                def http_error_307(self, req, fp, code, msg, headers):
+                    return self._raise(req, fp, code, msg, headers)
+                def http_error_308(self, req, fp, code, msg, headers):
+                    return self._raise(req, fp, code, msg, headers)
+                def _raise(self, req, fp, code, msg, headers):
+                    raise urllib.error.HTTPError(
+                        req.full_url, code, msg, headers, fp
+                    )
+
+            current_url = url
+            current_headers = {
+                "Authorization": f"Bearer {civitai_key}",
+                "Accept": "application/octet-stream",
+                "User-Agent": "curl/8.7.1",  # Cloudflare 403s Python-urllib UA
+            }
+            opener = urllib.request.build_opener(_NoFollow())
+            response = None
+            for hop in range(5):
+                req = urllib.request.Request(current_url, headers=current_headers)
+                try:
+                    response = opener.open(req, timeout=7200)
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code not in (301, 302, 303, 307, 308):
+                        raise RuntimeError(
+                            f"HTTP {e.code} from {current_url}: {e.reason}"
+                        ) from e
+                    location = e.headers.get("Location") if e.headers else None
+                    if not location:
+                        raise RuntimeError(
+                            f"HTTP {e.code} from {current_url} no Location"
+                        ) from e
+                    if urlparse(location).netloc != urlparse(current_url).netloc:
+                        current_headers = {
+                            k: v for k, v in current_headers.items()
+                            if k != "Authorization"
+                        }
+                    current_url = location
+                    log.info(f"civitai redirect hop {hop} → {urlparse(location).netloc}")
+            if response is None or response.status != 200:
+                raise RuntimeError(f"civitai download failed: {current_url}")
+            with open(dst, "wb") as f:
+                while True:
+                    chunk = response.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            response.close()
+        else:
+            # HF / other: simple urlopen with optional HF Bearer token.
+            hdr = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+            req = urllib.request.Request(url, headers=hdr)
             with urllib.request.urlopen(req, timeout=7200) as r, open(dst, "wb") as f:
                 while True:
                     chunk = r.read(8 * 1024 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
-            log.info(f"{rel_path}: done ({os.path.getsize(dst)/1e9:.2f} GB)")
-        except Exception as e:
-            log.error(f"Failed to download {rel_path}: {e}")
-            raise
+        log.info(f"{rel_path}: done ({os.path.getsize(dst)/1e9:.2f} GB)")
 
     wan22_models_volume.commit()
     return {"status": "ok", "files": len(WAN22_FILES)}
@@ -400,7 +488,8 @@ def _with_failure_marker(method):
     cpu=4,
     memory=16384,
     timeout=1800,                  # class-level container lifetime cap
-    enable_memory_snapshot=False,  # Task #176 (2026-09-18): snap=True caused snap-restore race that broke ComfyUI startup via _FakeProps.name AttributeError (and prior KeyError on memory_stats). WAN_TASK216 patches (a/b/c) remain as dead defense-in-depth. Cold-start ~22s→~44s, acceptable since min_containers=0 + scaledown_window=300 make cold-starts rare.
+    enable_memory_snapshot=False,  # Task #176 (2026-09-18): snap=True caused snap-restore race that broke ComfyUI startup via _FakeProps.name AttributeError. WAN_TASK216 patches stay as dead defense-in-depth.
+    experimental_options={"enable_gpu_snapshot": True},  # 2026-10-02: Phase C smoke was 15s faster than baseline (2:07 vs 2:22). Memory snapshot OFF (Task #176 race). GPU snapshot is experimental Modal feature, may have caveats.
     min_containers=0,
     scaledown_window=300,  # Task H (2026-09-17): 60→300 — Task C worker pre-warm on /api/run guarantees container alive at submit time, so 60s scaledown_window (Task G) was overkill. Bump back to 300s for safety margin: covers burst pattern (Gen 1 → 7+ min polling → Gen 2) where worker is busy on Gen 1 result fetch when Gen 2 pre-warm fires. With Task C + max_containers=1 + scaledown_window=300: container cold-starts ONCE per idle gap (≥300s = 5 min), then reused across burst.
     max_containers=1,  # Task G (2026-09-17): 20→1 — community pattern for stateful GPU model workloads. Modal cold-start loop root cause was: parallel requests were being load-balanced to NEW container instances (Modal's burst autoscaler), each needing 30-60s cold-start. With max_containers=1, all burst requests go to the SINGLE instance, processed via @modal.concurrent(target_inputs=1, max_inputs=1) below. No horizontal scaling, no cold-start loops. Cold-start pays ONCE per idle gap, then reuses. Task H (2026-09-17): paired with Task C pre-warm — pre-warm at submit time means container is alive when POST lands, so 60s window no longer needed. Trade-off: if 5+ simultaneous gens, 5th waits in queue — acceptable since BullMQ already serializes 1-at-a-time. OOM follow-up (2026-09-20): 4→1 because worker is BullMQ-serial (concurrency:1), so Modal-side 4-way concurrent would have stacked overlapping Wan 22B UNet activations and OOMed at node 151 sampler on 3rd consecutive gen.
@@ -1169,6 +1258,19 @@ class WanGenerator:
         # Track initial output files for diff-after-execution
         self._initial_outputs = set(os.listdir("/modal-data/output"))
         log.info(f"WanGenerator.setup() complete — initial_outputs={len(self._initial_outputs)}")
+
+    @modal.method()
+    def cold_start_smoke(self) -> str:
+        """Phase A/B/C test (2026-10-02): returns 'ready' once container is fully booted.
+
+        Used by the snapshot test harness to measure wall-clock time from
+        `modal run` invocation to first method return. Captures both:
+          - Modal cold-start queue delay (~19 min for wan22 heavy model)
+          - setup() time after container lands
+        Will be REMOVED before merging to production.
+        """
+        import time as _t
+        return f"ready@{_t.time()}"
 
     @modal.method()
     def generate(self, workflow_json: str, image_b64: str, nonce: str) -> bytes:
