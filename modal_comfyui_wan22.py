@@ -207,6 +207,18 @@ WAN22_FILES = [
         "https://civitai.com/api/download/models/2149614?fileId=2043063",
         582_000_000,
     ),
+    # ─── Wan 2.1 Penis LoRA (Task #73: bonus NSFW detail) 2026-10-03 ────────────
+    # CivitAI model 1358184 (aipinups69), modelVersionId 1534254, fileId 1434183.
+    # Single .safetensors, 293 MB. Wan 2.1 T2V/I2V (works on Wan 2.2 I2V-A14B
+    # high+low noise — same UNet blocks {0..41} architecture). Creator note: "best
+    # at POV angle, OK from side, can't do other angles" — designed to complement
+    # deepthroat/blowjob LoRAs. Used by clone style `wan22-hearmeman-60fps-nsfw-penis`
+    # (5 LoRAs per chain: lightx2v + NSFW HJ+BJ + this Penis LoRA in high AND low).
+    (
+        "loras/wan21_penis_dicks_epoch_100.safetensors",
+        "https://civitai.com/api/download/models/1534254?fileId=1434183",
+        290_000_000,  # 5% tolerance under real 293 MB
+    ),
     # ─── Style B (RIFE 60 FPS): RIFE VFI model, Task #15 (2026-09-27) + Task #268 ───
     # Fannovel16/ComfyUI-Frame-Interpolation vfi_utils.get_ckpt_container_path
     # returns `<custom_node>/ckpts/rife/` (NOT /ComfyUI/models/<sub>/). The
