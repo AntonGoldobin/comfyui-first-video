@@ -320,7 +320,7 @@ def comfyui_server():
         "/opt/venv/bin/python", "/usr/bin/python3",
         "/usr/local/bin/python3",
     ]:
-        if os.path.exists(cand) and os.access(cand, cand):
+        if os.path.exists(cand) and os.access(cand, os.X_OK):
             python_bin = cand
             break
     if not python_bin:
