@@ -273,10 +273,22 @@ def setup_image_gen_models(hf_token: str = "") -> dict:
 
 
 # =============================================================================
-# GPU class — runs ComfyUI on :8188, exposes the worker's expected endpoints
-# (/api/prompt, /api/history, /api/view, /api/object_info, /system_stats)
+# GPU function — runs ComfyUI on :8188 + exposes the port via @modal.web_server
 # =============================================================================
-@app.cls(
+# The worker's `submitJobLegacy` POSTs to /api/prompt and polls /api/history —
+# ComfyUI's native HTTP API. We expose :8188 directly so the worker talks to
+# ComfyUI as if it were local (no FastAPI proxy, no Rung 3 plumbing).
+#
+# Why a SINGLE function (not @app.cls + separate web_server): Modal's @app.cls
+# and @app.function live in SEPARATE containers. A separate web_server wouldn't
+# see the cls's ComfyUI subprocess. Co-locating setup + port-exposure in one
+# function is the only way to make /api/prompt reachable on the same container
+# that started ComfyUI.
+#
+# Trade-off: 150s Modal gateway timeout. Stage 1's 90s ceiling (R-IMAGE-2.2
+# plan) means cold-starts that exceed 150s are already a bug that should
+# fail-fast + refund, not a 303 transport break.
+@app.function(
     image=image,
     volumes={"/modal-data": image_gen_models_volume},
     cpu=4,
@@ -291,195 +303,158 @@ def setup_image_gen_models(hf_token: str = "") -> dict:
     region="us-east",
     gpu="H100",
 )
-class ImageGenGenerator:
-    @modal.enter(snap=False)
-    def setup(self):
-        """Initialize GPU container once per cold start. Symlinks models,
-        launches ComfyUI subprocess on :8188, waits for ready."""
-        import subprocess
-        import shutil
-        import httpx as _httpx
+@modal.web_server(8188, startup_timeout=600)
+def comfyui_server():
+    """Initialize GPU container once per cold start. Symlinks models,
+    launches ComfyUI subprocess on :8188, waits for ready."""
+    import subprocess
+    import shutil
+    import httpx as _httpx
 
-        log.info("=== ImageGenGenerator.setup() — initializing GPU container ===")
+    log.info("=== comfyui_server() — initializing GPU container ===")
 
-        # Find python interpreter (sombi image has /venv/bin/python3).
-        python_bin = None
-        for cand in [
-            "/venv/bin/python3", "/venv/bin/python",
-            "/opt/venv/bin/python", "/usr/bin/python3",
-            "/usr/local/bin/python3",
-        ]:
-            if os.path.exists(cand) and os.access(cand, cand):
-                python_bin = cand
-                break
-        if not python_bin:
-            python_bin = shutil.which("python3") or shutil.which("python")
-        if not python_bin:
-            raise RuntimeError("No python interpreter found in container")
-        log.info(f"Using python: {python_bin}")
+    # Find python interpreter (sombi image has /venv/bin/python3).
+    python_bin = None
+    for cand in [
+        "/venv/bin/python3", "/venv/bin/python",
+        "/opt/venv/bin/python", "/usr/bin/python3",
+        "/usr/local/bin/python3",
+    ]:
+        if os.path.exists(cand) and os.access(cand, cand):
+            python_bin = cand
+            break
+    if not python_bin:
+        python_bin = shutil.which("python3") or shutil.which("python")
+    if not python_bin:
+        raise RuntimeError("No python interpreter found in container")
+    log.info(f"Using python: {python_bin}")
 
-        # Symlink so any internal /runpod-volume paths in custom nodes work.
-        if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
-            os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
+    # Symlink so any internal /runpod-volume paths in custom nodes work.
+    if os.path.isdir("/runpod-volume") and not os.path.islink("/runpod-volume"):
+        os.system("rm -rf /runpod-volume && ln -s /modal-data /runpod-volume")
 
-        # Copy model subdirs from /modal-data/models/ → /ComfyUI/models/.
-        # ComfyUI scans /ComfyUI/models/<subdir>/ for ckpts at boot. We must
-        # copy because Modal Volumes mount as a single dir — ComfyUI won't
-        # re-scan /modal-data/models on its own.
-        def copy_dir_contents(src_dir, dst_dir):
-            if not os.path.isdir(src_dir):
-                return
-            os.makedirs(dst_dir, exist_ok=True)
-            for fname in os.listdir(dst_dir):
-                p = f"{dst_dir}/{fname}"
-                if os.path.islink(p):
-                    try:
-                        if os.path.realpath(p).startswith("/modal-data"):
-                            os.unlink(p)
-                    except Exception:
-                        pass
-            for fname in os.listdir(src_dir):
-                src = f"{src_dir}/{fname}"
-                dst = f"{dst_dir}/{fname}"
-                if os.path.isfile(dst) and not os.path.islink(dst):
-                    continue
-                if os.path.islink(dst):
-                    continue
-                if os.path.isdir(src):
-                    copy_dir_contents(src, dst)
-                    continue
-                log.info(f"Copying {src} → {dst}")
-                shutil.copy2(src, dst)
-
-        all_subs = (
-            "diffusion_models", "text_encoders", "vae",
-            "loras", "sams", "ultralytics",
-        )
-        for sub in all_subs:
-            os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
-            os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
-
-        copy_start = time.monotonic()
-        log.info("[INSTR_COPY] model copy START")
-        for sub in all_subs:
-            copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
-        log.info(f"[INSTR_COPY] model copy END duration={time.monotonic()-copy_start:.1f}s")
-
-        # Symlink /ComfyUI/output → /modal-data/output for SaveImage node.
-        os.makedirs("/modal-data/output", exist_ok=True)
-        if os.path.islink("/ComfyUI/output") or os.path.isdir("/ComfyUI/output"):
-            if os.path.islink("/ComfyUI/output"):
-                os.unlink("/ComfyUI/output")
-            else:
-                shutil.rmtree("/ComfyUI/output")
-        os.symlink("/modal-data/output", "/ComfyUI/output")
-        log.info("Linked /ComfyUI/output → /modal-data/output")
-
-        # Stream ComfyUI stdout/stderr to Modal container stdout (visible in
-        # `modal app logs`). Same pattern as wan22 app (line 1216-1225).
-        try:
-            if os.path.exists("/tmp/comfy.log") or os.path.islink("/tmp/comfy.log"):
-                os.unlink("/tmp/comfy.log")
-        except FileNotFoundError:
-            pass
-        try:
-            os.symlink("/proc/1/fd/1", "/tmp/comfy.log")
-            log.info("[INSTR_COMFYLOG] /tmp/comfy.log → /proc/1/fd/1")
-        except FileExistsError:
-            pass
-
-        log_file = open("/tmp/comfy.log", "w")
-        self._proc = subprocess.Popen(
-            [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
-             "--port", "8188", "--disable-auto-launch", "--gpu-only",
-             "--cache-none",
-             "--output-directory", "/modal-data/output"],
-            stdout=log_file, stderr=subprocess.STDOUT,
-        )
-        log.info(f"ComfyUI PID: {self._proc.pid}")
-
-        # Wait for ComfyUI ready (max 10 min for cold start).
-        for i in range(600):
-            try:
-                r = _httpx.get("http://localhost:8188/system_stats", timeout=2)
-                if r.status_code == 200:
-                    log.info(f"ComfyUI ready after {i+1}s")
-                    # Diagnostic: dump /object_info to verify custom nodes registered.
-                    try:
-                        oi = _httpx.get("http://localhost:8188/object_info", timeout=10)
-                        if oi.status_code == 200:
-                            names = sorted(oi.json().keys())
-                            log.info(f"[diag] ComfyUI loaded {len(names)} node types")
-                            for needle in ("easy loadImageBase64", "FaceDetailer",
-                                           "SAMLoader", "UltralyticsDetectorProvider",
-                                           "KSampler", "UNETLoader", "VAEEncode"):
-                                present = needle in names
-                                log.info(f"[diag] {needle}: {present}")
-                    except Exception as _diag_err:
-                        log.warning(f"[diag] /object_info probe failed: {_diag_err}")
-                    break
-            except Exception:
-                pass
-            if i > 0 and i % 30 == 0:
+    # Copy model subdirs from /modal-data/models/ → /ComfyUI/models/.
+    # ComfyUI scans /ComfyUI/models/<subdir>/ for ckpts at boot. We must
+    # copy because Modal Volumes mount as a single dir — ComfyUI won't
+    # re-scan /modal-data/models on its own.
+    def copy_dir_contents(src_dir, dst_dir):
+        if not os.path.isdir(src_dir):
+            return
+        os.makedirs(dst_dir, exist_ok=True)
+        for fname in os.listdir(dst_dir):
+            p = f"{dst_dir}/{fname}"
+            if os.path.islink(p):
                 try:
-                    with open("/tmp/comfy.log") as f:
-                        log.info(f"[comfy.log tail @ {i}s]\n{f.read()[-2000:]}")
+                    if os.path.realpath(p).startswith("/modal-data"):
+                        os.unlink(p)
                 except Exception:
                     pass
-            time.sleep(1)
+        for fname in os.listdir(src_dir):
+            src = f"{src_dir}/{fname}"
+            dst = f"{dst_dir}/{fname}"
+            if os.path.isfile(dst) and not os.path.islink(dst):
+                continue
+            if os.path.islink(dst):
+                continue
+            if os.path.isdir(src):
+                copy_dir_contents(src, dst)
+                continue
+            log.info(f"Copying {src} → {dst}")
+            shutil.copy2(src, dst)
+
+    all_subs = (
+        "diffusion_models", "text_encoders", "vae",
+        "loras", "sams", "ultralytics",
+    )
+    for sub in all_subs:
+        os.makedirs(f"/modal-data/models/{sub}", exist_ok=True)
+        os.makedirs(f"/ComfyUI/models/{sub}", exist_ok=True)
+
+    copy_start = time.monotonic()
+    log.info("[INSTR_COPY] model copy START")
+    for sub in all_subs:
+        copy_dir_contents(f"/modal-data/models/{sub}", f"/ComfyUI/models/{sub}")
+    log.info(f"[INSTR_COPY] model copy END duration={time.monotonic()-copy_start:.1f}s")
+
+    # Symlink /ComfyUI/output → /modal-data/output for SaveImage node.
+    os.makedirs("/modal-data/output", exist_ok=True)
+    if os.path.islink("/ComfyUI/output") or os.path.isdir("/ComfyUI/output"):
+        if os.path.islink("/ComfyUI/output"):
+            os.unlink("/ComfyUI/output")
         else:
+            shutil.rmtree("/ComfyUI/output")
+    os.symlink("/modal-data/output", "/ComfyUI/output")
+    log.info("Linked /ComfyUI/output → /modal-data/output")
+
+    # Stream ComfyUI stdout/stderr to Modal container stdout (visible in
+    # `modal app logs`). Same pattern as wan22 app (line 1216-1225).
+    try:
+        if os.path.exists("/tmp/comfy.log") or os.path.islink("/tmp/comfy.log"):
+            os.unlink("/tmp/comfy.log")
+    except FileNotFoundError:
+        pass
+    try:
+        os.symlink("/proc/1/fd/1", "/tmp/comfy.log")
+        log.info("[INSTR_COMFYLOG] /tmp/comfy.log → /proc/1/fd/1")
+    except FileExistsError:
+        pass
+
+    log_file = open("/tmp/comfy.log", "w")
+    proc = subprocess.Popen(
+        [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
+         "--port", "8188", "--disable-auto-launch", "--gpu-only",
+         "--cache-none",
+         "--output-directory", "/modal-data/output"],
+        stdout=log_file, stderr=subprocess.STDOUT,
+    )
+    log.info(f"ComfyUI PID: {proc.pid}")
+
+    # Wait for ComfyUI ready (max 10 min for cold start).
+    for i in range(600):
+        try:
+            r = _httpx.get("http://localhost:8188/system_stats", timeout=2)
+            if r.status_code == 200:
+                log.info(f"ComfyUI ready after {i+1}s")
+                # Diagnostic: dump /object_info to verify custom nodes registered.
+                try:
+                    oi = _httpx.get("http://localhost:8188/object_info", timeout=10)
+                    if oi.status_code == 200:
+                        names = sorted(oi.json().keys())
+                        log.info(f"[diag] ComfyUI loaded {len(names)} node types")
+                        for needle in ("easy loadImageBase64", "FaceDetailer",
+                                       "SAMLoader", "UltralyticsDetectorProvider",
+                                       "KSampler", "UNETLoader", "VAEEncode"):
+                            present = needle in names
+                            log.info(f"[diag] {needle}: {present}")
+                except Exception as _diag_err:
+                    log.warning(f"[diag] /object_info probe failed: {_diag_err}")
+                break
+        except Exception:
+            pass
+        if i > 0 and i % 30 == 0:
             try:
                 with open("/tmp/comfy.log") as f:
-                    log.error(f.read())
+                    log.info(f"[comfy.log tail @ {i}s]\n{f.read()[-2000:]}")
             except Exception:
                 pass
-            raise RuntimeError("ComfyUI startup timeout (ImageGenGenerator)")
-
-        # Initial output snapshot (for orphan cleanup if needed).
-        self._initial_outputs = set(os.listdir("/modal-data/output"))
-        log.info(f"ImageGenGenerator.setup() complete — initial_outputs={len(self._initial_outputs)}")
-
-
-# Expose ComfyUI on :8188 to the worker. Modal's @modal.web_server proxies
-# HTTPS traffic to the container's localhost:8188 — the worker's
-# `submitJobLegacy` then POSTs to /api/prompt as if ComfyUI were local.
-# This is the simplest path: no new endpoint surface, no Rung 3 plumbing.
-# The trade-off is the 150s Modal gateway limit, but Stage 1's 90s ceiling
-# (R-IMAGE-2.2 plan) means a cold-start that exceeds 150s is already a bug
-# that should fail-fast + refund, not a 303 transport break.
-@app.asgi()
-def fastapi_app():
-    """ASGI wrapper that proxies /api/* and /system_stats to ComfyUI on :8188."""
-    import httpx
-    from fastapi import FastAPI, Request
-    from fastapi.responses import Response, JSONResponse
-
-    web_app = FastAPI()
-    client = httpx.AsyncClient(base_url="http://localhost:8188", timeout=300.0)
-
-    @web_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-    async def proxy(request: Request, path: str):
+        time.sleep(1)
+    else:
         try:
-            body = await request.body()
-            upstream = await client.request(
-                method=request.method,
-                url=f"/{path}",
-                content=body,
-                headers={k: v for k, v in request.headers.items()
-                         if k.lower() not in ("host", "content-length")},
-                params=request.query_params,
-            )
-            return Response(
-                content=upstream.content,
-                status_code=upstream.status_code,
-                headers={k: v for k, v in upstream.headers.items()
-                         if k.lower() not in ("content-encoding", "transfer-encoding",
-                                              "content-length")},
-            )
-        except httpx.RequestError as e:
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"upstream ComfyUI unreachable: {e!r}"},
-            )
+            with open("/tmp/comfy.log") as f:
+                log.error(f.read())
+        except Exception:
+            pass
+        raise RuntimeError("ComfyUI startup timeout (comfyui_server)")
 
-    return web_app
+    # Initial output snapshot (for orphan cleanup if needed).
+    log.info(f"comfyui_server() ready — initial_outputs={len(os.listdir('/modal-data/output'))}")
+
+    # Block forever — @modal.web_server keeps the container alive as long as
+    # this function is running. The 1800s timeout (declared on @app.function)
+    # is the upper bound; scaledown_window=300s after last request.
+    while True:
+        time.sleep(60)
+        # Liveness check — if ComfyUI died, exit so Modal restarts the container.
+        if proc.poll() is not None:
+            log.error(f"ComfyUI subprocess exited with code {proc.returncode}")
+            raise RuntimeError(f"ComfyUI died (exit={proc.returncode})")
