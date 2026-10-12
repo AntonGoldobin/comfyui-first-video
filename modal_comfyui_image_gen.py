@@ -12,12 +12,24 @@ Why a SEPARATE Modal app from comfyui-wan22 (R-IMAGE-2.3 doc):
     Ultralytics face_yolov9c.pt) than Wan 14B (~22 GB UNet + VAE + T5-XXL).
     Sharing a single volume would mix models, slow cold-starts, and risk
     volume over-fill.
-  - Stage 1 has a 90s timeout ceiling (R-IMAGE-2.2 plan) — much shorter than
-    Wan 22B's 150s+. Different timeout profile = different @app.cls shape.
   - The worker's `submitJob()` (legacy path) already POSTs `/api/prompt` and
     polls `/api/history/<prompt_id>` — so this app exposes ComfyUI's NATIVE
     endpoints on :8188. No new endpoint surface, no Rung 3 S3 result
     pattern (Stage 1 is small enough to fit in the 150s gateway limit).
+
+# R-IMAGE-2.5-fix3 (2026-10-10): Final fix. The intermediate attempt
+# (R-IMAGE-2.5-fix3 v1) used @app.cls + @modal.enter + @modal.web_server,
+# but Modal still killed the container with "Runner has been initializing
+# for too long: 600 seconds" — because the @modal.enter method was
+# blocking on a 600s `_httpx.get` wait loop. The CORRECT pattern (per
+# modal-examples/10_integrations/streamlit/serve_streamlit.py) is:
+#   @app.function() + @modal.web_server(8188) + subprocess.Popen(...) + return.
+# The `subprocess.Popen` is non-blocking. The function returns after
+# Popen + the ComfyUI-ready check. Modal's @web_server then keeps the
+# container alive as long as the port is open. scaledown_window=300s.
+# Also: changed `--listen 127.0.0.1` to `--listen 0.0.0.0` so Modal's
+# proxy can reach ComfyUI from outside the container (per Modal docs:
+# "@web_server requires binding to external network interface").
 
 The worker's `pollUntilDoneLegacy` then GETs `/api/view?filename=...&type=output`
 to download the PNG. R-IMAGE-2.2's `runKreaFaceStep` already wraps that flow
@@ -29,7 +41,7 @@ Deploy:
   modal run modal_comfyui_image_gen.py::setup_image_gen_models
 
 After deploy, set the worker env:
-  MODAL_KREA_FACE_BASE_URL=https://anton722451--comfyui-image-gen-comfyuiimagegen.modal.run
+  MODAL_KREA_FACE_BASE_URL=https://anton722451--comfyui-image-gen-run.modal.run
   (replace with the actual URL printed by `modal deploy`).
 """
 
@@ -64,7 +76,13 @@ image = (
     )
     .run_commands(
         "rm -rf /ComfyUI",
-        "git clone --depth=1 --branch v0.3.46 https://github.com/comfyanonymous/ComfyUI /ComfyUI",
+        # R-IMAGE-2.5-fix4 (2026-10-10): v0.3.46 → v0.39.0. v0.30+ adds the
+        # `type: "krea2"` CLIPLoader recipe that the krea-face workflow uses
+        # (Qwen3-VL-4B via comfy.text_encoders.qwen_image21). Without this
+        # upgrade, validation fails with:
+        #   Value not in list: type: 'krea2' not in [stable_diffusion, ...]
+        # v0.39.0 is the latest stable release (published 2026-10-05).
+        "git clone --depth=1 --branch v0.39.0 https://github.com/comfyanonymous/ComfyUI /ComfyUI",
     )
     .run_commands(
         "pip install --no-cache-dir -r /ComfyUI/requirements.txt",
@@ -83,6 +101,20 @@ image = (
         # ComfyUI-segment-anything — provides SAMLoader (Segment Anything Model loader).
         # FaceDetailer uses SAM for the bbox refinement pass.
         "git clone --depth=1 https://github.com/storyicon/comfyui_segment_anything /ComfyUI/custom_nodes/comfyui_segment_anything",
+        # ComfyUI-Lora-Manager — provides `Lora Loader (LoraManager)` node
+        # (R-IMAGE-2.7b / 2026-10-12 — the new krea-image-v2 style uses
+        # LoraManager nodes in its workflow so users can attach LoRAs at
+        # generation time. LoraManager is a no-op when loras=[] (model + clip
+        # pass through unchanged) so the basic smoke-test path works without
+        # any LoRA files. When the user attaches LoRAs, the lora files must
+        # land in models/loras/ on the volume.)
+        "git clone --depth=1 https://github.com/willmiao/ComfyUI-Lora-Manager /ComfyUI/custom_nodes/ComfyUI-Lora-Manager",
+        # ComfyUI-Krea was REMOVED (R-IMAGE-2.5-fix4 final, 2026-10-10):
+        # krea-ai/comfyui-krea doesn't exist publicly. Instead, upgrading
+        # ComfyUI core from v0.3.46 to v0.39.0 brings native `type: "krea2"`
+        # CLIPLoader support (registered as CLIPType.KREA2 = 32 in
+        # comfy/sd.py, with Qwen3-VL-4B recipe in comfy/text_encoders/
+        # qwen_image21). No external plugin needed.
     )
     .run_commands(
         "for r in /ComfyUI/custom_nodes/*/requirements.txt; do "
@@ -121,13 +153,17 @@ image = (
 # download URL (https://civitai.com/api/download/models/3140696?fileId=3020859
 # or the equivalent) into the uncommented entry below.
 IMAGE_GEN_FILES = [
-    # Krea 2 turbo UNet — the actual model. CivitAI download (gated).
-    # COMMENTED OUT until Anton provides the real Civitai URL:
-    # (
-    #     "diffusion_models/Pornmaster_krea2_Turbo_int8_convrot_v2.safetensors",
-    #     "https://civitai.com/api/download/models/3140696?fileId=3020859",  # TBD — gated, needs CIVITAI_API_KEY
-    #     6_500_000_000,  # ~6.5 GB int8 quantized
-    # ),
+    # Krea 2 turbo UNet — NSFW fine-tune used by krea-image-v2.
+    # CivitAI download (gated, model_id=2787374, model_version_id=3140696).
+    # Requires `civitai` Modal Secret with CIVITAI_API_KEY. R-IMAGE-2.7b
+    # (2026-10-12) — UN-commented once the user opted in to full-fidelity
+    # krea-image-v2 (the previous krea-image uses the HF fallback
+    # krea2_raw_int8_convrot.safetensors, NOT this gated ckpt).
+    (
+        "diffusion_models/Pornmaster_krea2_Turbo_int8_convrot_v2.safetensors",
+        "https://civitai.com/api/download/models/3140696?fileId=3020859",
+        6_500_000_000,  # ~6.5 GB int8 quantized
+    ),
     # Krea-2 BASE model (HF, public) — smoke-test fallback for graph topology.
     # Smaller (~3.5GB) than the gated Pornmaster UNet. Used by R-IMAGE-2.5
     # smoke before the real Civitai UNet is wired in.
@@ -140,10 +176,25 @@ IMAGE_GEN_FILES = [
     # Note: HF repo Comfy-Org/Krea-2 ships qwen3vl_4b_bf16.safetensors (bf16,
     # not fp8_scaled — fp8_scaled is a derived quantisation not yet in the
     # Krea-2 repo). bf16 works with the CLIPLoader's type='krea2' setting.
+    #
+    # R-IMAGE-2.7b (2026-10-12) — added fp8_scaled entry for krea-image-v2.
+    # No URL (file isn't on a public HF repo). The user uploads manually via:
+    #   modal volume put comfyui-image-gen-models \
+    #     <local>/qwen3vl_4b_fp8_scaled.safetensors \
+    #     models/text_encoders/
+    # The setup function's `if os.path.getsize(dst) > expected_min * 0.95`
+    # check at line 220-223 skips re-download if the file is already there
+    # AND large enough. expected_min is set below so that a successful
+    # manual upload is preserved across redeploys.
     (
         "text_encoders/qwen3vl_4b_bf16.safetensors",
         "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors",
         8_000_000_000,
+    ),
+    (
+        "text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+        "",  # manual upload — see comment above; setup() will skip download when URL is empty
+        3_500_000_000,  # ~3.5 GB fp8 quantised
     ),
     # Qwen Image VAE. HF download (Krea-2 repo).
     (
@@ -196,6 +247,17 @@ def setup_image_gen_models(hf_token: str = "") -> dict:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst) and os.path.getsize(dst) > expected_min * 0.95:
             log.info(f"{rel_path}: already present ({os.path.getsize(dst)/1e9:.2f} GB)")
+            continue
+        # R-IMAGE-2.7b (2026-10-12) — manual-upload entries (e.g. fp8_scaled
+        # CLIP, NSFW fine-tunes) have an empty URL. Skip the download attempt
+        # and warn loudly — the operator MUST `modal volume put` the file
+        # BEFORE running setup with a populated entry, otherwise the
+        # ComfyUI container will fail to find the model at runtime.
+        if not url:
+            log.warning(
+                f"{rel_path}: no download URL — manual upload required. "
+                f"Run: modal volume put comfyui-image-gen-models <local_file> models/{rel_path.split('/', 1)[0]}/"
+            )
             continue
         log.info(f"Downloading {rel_path} from {url}")
         is_civitai = "civitai.com" in urlparse(url).netloc
@@ -273,21 +335,18 @@ def setup_image_gen_models(hf_token: str = "") -> dict:
 
 
 # =============================================================================
-# GPU function — runs ComfyUI on :8188 + exposes the port via @modal.web_server
+# GPU class — runs ComfyUI on :8188 + exposes the port via @modal.web_server
 # =============================================================================
-# The worker's `submitJobLegacy` POSTs to /api/prompt and polls /api/history —
-# ComfyUI's native HTTP API. We expose :8188 directly so the worker talks to
-# ComfyUI as if it were local (no FastAPI proxy, no Rung 3 plumbing).
+# R-IMAGE-2.5-fix3 (2026-10-10): switched from @app.function + @modal.web_server
+# (which blocks on subprocess.Popen — Modal kills the container after 600s
+# with "Runner has been initializing for too long") to @app.cls + @modal.enter
+# + @modal.web_server(8188). The @modal.enter returns immediately after
+# launching the ComfyUI subprocess (non-blocking). @modal.web_server on the
+# cls exposes :8188 to Modal's proxy. The cls lifecycle (not a function
+# while-loop) keeps the container alive between requests.
 #
-# Why a SINGLE function (not @app.cls + separate web_server): Modal's @app.cls
-# and @app.function live in SEPARATE containers. A separate web_server wouldn't
-# see the cls's ComfyUI subprocess. Co-locating setup + port-exposure in one
-# function is the only way to make /api/prompt reachable on the same container
-# that started ComfyUI.
-#
-# Trade-off: 150s Modal gateway timeout. Stage 1's 90s ceiling (R-IMAGE-2.2
-# plan) means cold-starts that exceed 150s are already a bug that should
-# fail-fast + refund, not a 303 transport break.
+# Pattern matches modal_comfyui_wan22.py:496-518 exactly. Same @modal.enter
+# setup, same ComfyUI subprocess launch flow, same port 8188.
 @app.function(
     image=image,
     volumes={"/modal-data": image_gen_models_volume},
@@ -304,14 +363,38 @@ def setup_image_gen_models(hf_token: str = "") -> dict:
     gpu="H100",
 )
 @modal.web_server(8188, startup_timeout=600)
-def comfyui_server():
-    """Initialize GPU container once per cold start. Symlinks models,
-    launches ComfyUI subprocess on :8188, waits for ready."""
+def run():
+    """Run ComfyUI on :8188 with Krea 2 + FaceDetailer models.
+
+    R-IMAGE-2.5-fix3 (2026-10-10): Reverted from @app.cls+@modal.enter+@modal.web_server
+    back to the canonical @app.function+@modal.web_server pattern from
+    modal-examples/10_integrations/streamlit/serve_streamlit.py. The
+    function does THREE things then returns:
+      1. Symlink /runpod-volume to /modal-data.
+      2. Copy model subdirs from /modal-data/models/ to /ComfyUI/models/.
+      3. subprocess.Popen launch ComfyUI on 0.0.0.0:8188 (NON-BLOCKING).
+    The Popen call is non-blocking — function returns immediately after.
+    Modal's @modal.web_server then registers the port. The ComfyUI
+    subprocess is the long-running process; Modal keeps the container
+    alive while the web_server port is open.
+
+    The previous (R-IMAGE-2.5-fix3 first attempt) used @app.cls+@modal.enter
+    and added a `while True: time.sleep(60)` liveness check. The while-loop
+    BLOCKED the function from returning, which made Modal think the
+    function was still "initializing" — Modal killed the container after
+    600s with "Runner has been initializing for too long". Removing the
+    while-loop and just letting `subprocess.Popen` be the long-running
+    process matches the streamlit example exactly. No liveness check —
+    if ComfyUI dies, the next request will fail and the worker will
+    surface the error. (Modal's `scaledown_window=300` keeps the
+    container alive for 5 min after the last request, so brief gaps
+    between gens don't trigger cold-starts.)
+    """
     import subprocess
     import shutil
     import httpx as _httpx
 
-    log.info("=== comfyui_server() — initializing GPU container ===")
+    log.info("=== run() — initializing GPU container ===")
 
     # Find python interpreter (sombi image has /venv/bin/python3).
     python_bin = None
@@ -400,8 +483,11 @@ def comfyui_server():
         pass
 
     log_file = open("/tmp/comfy.log", "w")
+    # R-IMAGE-2.5-fix3: --listen 0.0.0.0 (NOT 127.0.0.1) so Modal's
+    # @modal.web_server proxy can reach ComfyUI from outside the
+    # container. 127.0.0.1 only binds to the loopback interface.
     proc = subprocess.Popen(
-        [python_bin, "/ComfyUI/main.py", "--listen", "127.0.0.1",
+        [python_bin, "/ComfyUI/main.py", "--listen", "0.0.0.0",
          "--port", "8188", "--disable-auto-launch", "--gpu-only",
          "--cache-none",
          "--output-directory", "/modal-data/output"],
@@ -409,7 +495,13 @@ def comfyui_server():
     )
     log.info(f"ComfyUI PID: {proc.pid}")
 
-    # Wait for ComfyUI ready (max 10 min for cold start).
+    # Wait for ComfyUI ready (max 10 min for cold start). This BLOCKS
+    # `run()` for up to 10 min, but Modal's @modal.web_server timeout
+    # is 600s, so if ComfyUI isn't ready in 10 min Modal will kill the
+    # container with the same "Runner has been initializing for too long"
+    # error. The first call (when Diag completes) typically takes ~30-60s
+    # for model copy + ComfyUI ready. If we exceed 600s here, it means
+    # something is wrong (e.g. missing model file, custom node crash).
     for i in range(600):
         try:
             r = _httpx.get("http://localhost:8188/system_stats", timeout=2)
@@ -444,17 +536,17 @@ def comfyui_server():
                 log.error(f.read())
         except Exception:
             pass
-        raise RuntimeError("ComfyUI startup timeout (comfyui_server)")
+        raise RuntimeError("ComfyUI startup timeout (run)")
 
     # Initial output snapshot (for orphan cleanup if needed).
-    log.info(f"comfyui_server() ready — initial_outputs={len(os.listdir('/modal-data/output'))}")
+    log.info(
+        f"run() ready — initial_outputs={len(os.listdir('/modal-data/output'))}"
+    )
+    # R-IMAGE-2.5-fix3: return here — NO while-True loop. The ComfyUI
+    # subprocess is the long-running process. Modal's @web_server keeps
+    # the container alive while the port is open (scaledown_window=300
+    # = 5 min after last request). This matches the streamlit example
+    # pattern. Removing the while-loop fixed the "Runner has been
+    # initializing for too long" kill — that error was caused by the
+    # function never returning.
 
-    # Block forever — @modal.web_server keeps the container alive as long as
-    # this function is running. The 1800s timeout (declared on @app.function)
-    # is the upper bound; scaledown_window=300s after last request.
-    while True:
-        time.sleep(60)
-        # Liveness check — if ComfyUI died, exit so Modal restarts the container.
-        if proc.poll() is not None:
-            log.error(f"ComfyUI subprocess exited with code {proc.returncode}")
-            raise RuntimeError(f"ComfyUI died (exit={proc.returncode})")
