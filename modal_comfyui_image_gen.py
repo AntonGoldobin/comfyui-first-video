@@ -221,6 +221,7 @@ IMAGE_GEN_FILES = [
 @app.function(
     image=image,
     volumes={"/modal-data": image_gen_models_volume},
+    secrets=[modal.Secret.from_name("civitai-api-key")],
     cpu=4,
     memory=8192,
     timeout=7200,
