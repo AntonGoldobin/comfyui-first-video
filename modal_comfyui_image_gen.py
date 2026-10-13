@@ -191,14 +191,9 @@ IMAGE_GEN_FILES = [
     # Krea-2 repo). bf16 works with the CLIPLoader's type='krea2' setting.
     #
     # R-IMAGE-2.7b (2026-10-12) — added fp8_scaled entry for krea-image-v2.
-    # No URL (file isn't on a public HF repo). The user uploads manually via:
-    #   modal volume put comfyui-image-gen-models \
-    #     <local>/qwen3vl_4b_fp8_scaled.safetensors \
-    #     models/text_encoders/
-    # The setup function's `if os.path.getsize(dst) > expected_min * 0.95`
-    # check at line 220-223 skips re-download if the file is already there
-    # AND large enough. expected_min is set below so that a successful
-    # manual upload is preserved across redeploys.
+    # Source discovered 2026-10-13: HF user AlperKTS/Krea2_FP8 repo
+    # (third-party derivative, ~5.24 GB, smaller than bf16's 8.3 GB → lower
+    # VRAM). Not on Civitai or the official Comfy-Org/Krea-2 repo.
     (
         "text_encoders/qwen3vl_4b_bf16.safetensors",
         "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_bf16.safetensors",
@@ -206,8 +201,8 @@ IMAGE_GEN_FILES = [
     ),
     (
         "text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
-        "",  # manual upload — see comment above; setup() will skip download when URL is empty
-        3_500_000_000,  # ~3.5 GB fp8 quantised
+        "https://huggingface.co/AlperKTS/Krea2_FP8/resolve/main/qwen3vl_4b_fp8_scaled.safetensors",
+        5_000_000_000,  # ~5.24 GB fp8 quantised (HF-reported, 5_242_467_968 bytes)
     ),
     # Qwen Image VAE. HF download (Krea-2 repo).
     (
