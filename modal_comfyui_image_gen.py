@@ -154,20 +154,27 @@ image = (
 # or the equivalent) into the uncommented entry below.
 IMAGE_GEN_FILES = [
     # Krea 2 Turbo UNet (CivitAI gated) used by krea-image-v2.
-    # Source: model 2726029 "Krea 2 Turbo Official Comfy-Org Checkpoints",
-    # version 3091481 (krea2_turbo_int8_convrot), fileId 2971089 —
-    # 13.2 GB. Picked 2026-10-13 after diagnosing that the previous URL
-    # (models/3140696?fileId=3020859) actually points to model 2787374,
-    # a "Workflows"-type ZIP of 3 ComfyUI workflow JSONs (~83 KB total),
-    # NOT a safetensors. The user's local filename
-    # `Pornmaster_krea2_Turbo_int8_convrot_v2.safetensors` is a renamed
-    # copy of one of these official Comfy-Org variants; we use the
-    # Comfy-Org original since it's the same authors as the working
-    # krea2_raw_int8_convrot (HF fallback) and UNETLoader-compatible.
-    # See handover: comfyui-first-video r-image-2-7b-... for diagnosis.
+    # Source: CivitAI model 2726029 "Krea 2 Turbo Official Comfy-Org
+    # Checkpoints" → version 3091481 (krea2_turbo_int8_convrot) →
+    # fileId 2971089 — 13.2 GB.
+    #
+    # Picked 2026-10-13 after diagnosing that the previous URL
+    # (models/3140696?fileId=3020859) was wrong on BOTH axes:
+    #  1. 3140696 is a *version* id that doesn't resolve (CivitAI 404);
+    #     the correct path parameter is the modelVersionId, not the
+    #     modelId. 3091481 is the actual version id for v 3091481 of
+    #     model 2726029.
+    #  2. fileId 3020859 points to a "Workflows"-type ZIP (model 2787374,
+    #     83 KB total) — not a safetensors.
+    #
+    # The user's local filename `Pornmaster_krea2_Turbo_int8_convrot_v2
+    # .safetensors` is a renamed copy of one of these official Comfy-Org
+    # variants; we use the Comfy-Org original since it's the same
+    # authors as the working krea2_raw_int8_convrot (HF fallback) and
+    # UNETLoader-compatible.
     (
         "diffusion_models/Pornmaster_krea2_Turbo_int8_convrot_v2.safetensors",
-        "https://civitai.com/api/download/models/2726029?fileId=2971089",
+        "https://civitai.com/api/download/models/3091481?fileId=2971089",
         12_500_000_000,  # ~13.2 GB int8 (CivitAI-reported sizeKB=13_176_452)
     ),
     # Krea-2 BASE model (HF, public) — smoke-test fallback for graph topology.
